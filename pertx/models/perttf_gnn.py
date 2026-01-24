@@ -30,6 +30,7 @@ from ..layers.modules import (
     GeneHead,
     GeneHybridEmbedding
 )
+from ..layers.gnn import LearnableWeightedRGCN2
 
 
 class PertTFGraphModel(BaseModel):
@@ -46,11 +47,12 @@ class PertTFGraphModel(BaseModel):
         self.pred_lochness_next = kwargs.pop("pred_lochness_next", False) # additional optional parameter to ask whether to predict lochness scores
         ps_decoder2_nlayer = kwargs.pop("ps_decoder2_nlayer",3) # additional parameter to specify ps_decoder2 nlayer
         self.pert_pad_id = kwargs.pop("pert_pad_id", None) # get the pert_pad_id
-        self.pert_dim = kwargs.pop('pert_dim', None)
-        self.sep_pert_mvc = kwargs.pop('sep_pert_mvc', False)
-        self.mvc_residual = kwargs.pop('mvc_residual', False)
-        self.pert_style = kwargs.pop('pert_style', 'concat')
-        self.gene_pert_shared = kwargs.pop('gene_pert_shared', False)
+        self.pert_dim = kwargs.pop('pert_dim', None) # pert emb dimensions
+        self.pert_style = kwargs.pop('pert_style', 'concat') # style of pert emb and cls emb fusion
+        self.gene_pert_shared = kwargs.pop('gene_pert_shared', False) # gene emb and pert emb share base emb
+        self.sep_pert_mvc = kwargs.pop('sep_pert_mvc', False) # seperate mvc decoder for pertub expr
+        self.mvc_residual = kwargs.pop('mvc_residual', False) # mvc predict residual instead of expression
+        self.mvc_incl_val = kwargs.pop('mvc_incl_val', False) # mvc gene embs incl expr embed
         super().__init__(*args, **kwargs)
         self.pert_graph = pert_graph
         self.active_indices = active_indices
@@ -78,12 +80,12 @@ class PertTFGraphModel(BaseModel):
         else: # graph embeddings
             if self.base_emb is None: # vanilla embeddings
                 if self.gene_pert_shared: # shared encoder for perturbation
-                    self.pert_encoder = LearnableWeightedRGCN(n_pert, pert_dim, self.pert_graph, self.encoder, self.active_indices)
+                    self.pert_encoder = LearnableWeightedRGCN2(n_pert, pert_dim, self.pert_graph, self.encoder, self.active_indices)
                 else:
-                    self.pert_encoder = LearnableWeightedRGCN(n_pert, pert_dim, self.pert_graph)
+                    self.pert_encoder = LearnableWeightedRGCN2(n_pert, pert_dim, self.pert_graph)
             else:
                 self.pert_base_emb = self.base_emb if self.gene_pert_shared else copy.deepcopy(self.base_emb)
-                self.pert_encoder = LearnableWeightedRGCN(n_pert, pert_dim, self.pert_graph, self.pert_base_emb.embedding, self.active_indices)
+                self.pert_encoder = LearnableWeightedRGCN2(n_pert, pert_dim, self.pert_graph, self.pert_base_emb.embedding, self.active_indices)
 
         # Select Perturbation Integration Style
         if self.pert_style == 'concat':
@@ -99,7 +101,7 @@ class PertTFGraphModel(BaseModel):
         self.batch2_encoder = BatchLabelEncoder(2, d_model) # should replace 2 to n_batch later
         self.n_pert = n_pert
         if self.sep_pert_mvc:
-            self.pert_mvc_decoder = MVCDecoder(
+            self.mvc_decoder2 = MVCDecoder(
                 d_model,
                 arch_style=self.mvc_decoder_style,
                 explicit_zero_prob=self.explicit_zero_prob,
@@ -107,7 +109,7 @@ class PertTFGraphModel(BaseModel):
                 expr_activation=self.expr_activation
             )
         else:
-            self.pert_mvc_decoder = self.mvc_decoder
+            self.mvc_decoder2 = None
         
         # added: adding PS score decoder
         #self.n_ps = kwargs.get("n_ps") if "n_ps" in kwargs else 0
@@ -135,7 +137,7 @@ class PertTFGraphModel(BaseModel):
         self._check_batch_labels(batch_labels)
 
         src = self.encoder(src)  # (batch, seq_len, embsize)
-        self.cur_gene_token_embs = src
+        
 
         values = self.value_encoder(values)  # (batch, seq_len, embsize)
 
@@ -144,7 +146,7 @@ class PertTFGraphModel(BaseModel):
             total_embs = src * values
         else:
             total_embs = src + values
-
+        self.cur_gene_token_embs = src #+ values # should we encode this into the cur_gene_tokens?
         # add additional perturbs
         if input_pert_flags is not None:
             perts = self.pert_encoder(input_pert_flags)  # (batch, seq_len, embsize)
@@ -180,6 +182,7 @@ class PertTFGraphModel(BaseModel):
         self,
         src: Tensor,
         values: Tensor,
+        target_values: Tensor,
         src_key_padding_mask: Tensor,
         batch_labels: Optional[Tensor] = None,
         pert_labels: Optional[Tensor] = None, 
@@ -191,7 +194,8 @@ class PertTFGraphModel(BaseModel):
         PERTPRED: bool = False,
         do_sample: bool = False,
         PSPRED: bool = False,
-        mvc_src: Tensor = None 
+        mvc_src: Tensor = None,
+        mvc_val: Tensor = None
     ) -> Mapping[str, Tensor]:
         """
         Args:
@@ -223,7 +227,11 @@ class PertTFGraphModel(BaseModel):
             src, values, src_key_padding_mask, batch_labels,
             input_pert_flags= pert_labels, # Do we use pert_flags for transformer input?
         )
+        
         cur_gene_token_embs = self.encoder(mvc_src) if mvc_src is not None else self.cur_gene_token_embs
+        if self.mvc_incl_val:
+            val_emb = self.value_encoder(mvc_val) if mvc_src is not None else self.value_encoder(target_values)
+            cur_gene_token_embs = cur_gene_token_embs + val_emb
         if self.decoder_layer:
             cur_gene_token_embs = self.transformer_decoder(cur_gene_token_embs, transformer_output, memory_key_padding_mask=src_key_padding_mask)
         if self.use_batch_labels:
@@ -296,17 +304,22 @@ class PertTFGraphModel(BaseModel):
                 # else cell_emb + batch_emb,
                 cur_gene_token_embs,
             )
-            if self.mvc_residual:
-                mvc_output["pred"] = mvc_output["pred"] + values
-                mvc_output_next["pred"] = mvc_output_next["pred"] + values
+            
+            pert_mvc_decoder = self.mvc_decoder if not self.sep_pert_mvc else self.mvc_decoder2
 
-            mvc_output_next = self.pert_mvc_decoder(
+            mvc_output_next = pert_mvc_decoder(
                 cell_emb_next
                 if not self.use_batch_labels
                 else torch.cat([cell_emb_next, batch_emb], dim=1),
                 # else cell_emb + batch_emb,
                 cur_gene_token_embs, # is it working well??
             )
+
+            if self.mvc_residual:
+                mvc_base_val = mvc_val if mvc_src is not None else target_values
+                mvc_output["pred"] = mvc_output["pred"] + mvc_base_val
+                mvc_output_next["pred"] = mvc_output_next["pred"] + mvc_base_val
+
             if self.explicit_zero_prob and do_sample:
                 bernoulli = Bernoulli(probs=mvc_output["zero_probs"])
                 output["mvc_output"] = bernoulli.sample() * mvc_output["pred"]
@@ -368,7 +381,8 @@ class PertTFGraphModel(BaseModel):
         time_step: Optional[int] = None,
         return_np: bool = False,
         predict_expr = False,
-        mvc_src: Tensor = None # optional MVC tensor of gene ids for MVC decoder
+        mvc_src: Tensor = None, # optional MVC tensor of gene ids for MVC decoder
+        mvc_val: Tensor = None
     ) -> Tuple[Tensor, Tensor, Tensor]:
         """
         revised scgpt.TransformerModel.encode_batch but with additional perturbation
@@ -429,11 +443,13 @@ class PertTFGraphModel(BaseModel):
         for i in trange(0, N, batch_size):
             src_d = src[i : i + batch_size].to(device)
             values_d = values[i : i + batch_size].to(device)
+            target_values_d = values[i : i + batch_size].to(device)
             src_key_padding_mask_d = src_key_padding_mask[i : i + batch_size].to(device)
             batch_labels_d = batch_labels[i : i + batch_size].to(device) if batch_labels is not None else None
             pert_labels_d = pert_labels[i : i + batch_size].to(device) if pert_labels is not None else None
             pert_labels_next_d = pert_labels_next[i : i + batch_size].to(device) if pert_labels_next is not None else None
             mvc_src_d = mvc_src[i:i+batch_size].to(device) if mvc_src is not None else None
+            mvc_val_d = mvc_val[i:i+batch_size].to(device) if mvc_src is not None else None
             raw_output = self._encode(
                 src_d,
                 values_d,
@@ -523,7 +539,11 @@ class PertTFGraphModel(BaseModel):
                 ),
                 # else transformer_output + batch_emb.unsqueeze(1),
                 )
-                cur_gene_token_embs = self.encoder(mvc_src_d) if mvc_src_d is not None else self.cur_gene_token_embs
+                #cur_gene_token_embs = self.encoder(mvc_src_d) if mvc_src_d is not None else self.cur_gene_token_embs
+                cur_gene_token_embs = self.encoder(mvc_src_d) if mvc_src is not None else self.cur_gene_token_embs
+                if self.mvc_incl_val:
+                    val_emb = self.value_encoder(mvc_val_d) if mvc_src is not None else self.value_encoder(target_values_d)
+                    cur_gene_token_embs = cur_gene_token_embs + val_emb
                 if self.decoder_layer:
                     cur_gene_token_embs = self.transformer_decoder(cur_gene_token_embs, raw_output, memory_key_padding_mask=src_key_padding_mask_d)
                 mvc_output = self.mvc_decoder(
@@ -533,7 +553,8 @@ class PertTFGraphModel(BaseModel):
                                 ), # else cell_emb + batch_emb,
                             cur_gene_token_embs,)
                 if pert_labels_next_d is not None:
-                    mvc_output_next = self.pert_mvc_decoder(
+                    pert_mvc_decoder = self.mvc_decoder if not self.sep_pert_mvc else self.mvc_decoder2
+                    mvc_output_next = pert_mvc_decoder(
                                 cell_emb_next if not self.use_batch_labels
                                 else torch.cat([cell_emb_next, batch_emb], 
                                 dim=1
@@ -541,7 +562,10 @@ class PertTFGraphModel(BaseModel):
                             cur_gene_token_embs,)
                 else:
                     mvc_output_next = mvc_output
-
+                if self.mvc_residual:
+                    mvc_base_val = mvc_val_d if mvc_src is not None else target_values_d
+                    mvc_output["pred"] = mvc_output["pred"] + mvc_base_val
+                    mvc_output_next["pred"] = mvc_output_next["pred"] + mvc_base_val
                 mlm_pred, mlm_zero_probs = mlm_output['pred'], mlm_output['zero_probs'] if self.explicit_zero_prob else 1
                 mvc_pred, mvc_zero_probs = mvc_output['pred'], mvc_output['zero_probs'] if self.explicit_zero_prob else 1
                 mvc_pred_next, mvc_zero_probs_next = mvc_output_next['pred'], mvc_output_next['zero_probs'] if self.explicit_zero_prob else 1

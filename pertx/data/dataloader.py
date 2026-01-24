@@ -46,7 +46,8 @@ class PertTFDataset(Dataset):
                  ps_columns_perturbed_genes: list = None, 
                  next_cell_pred: str = "identity", 
                  additional_ps_dict: dict = None, 
-                 only_sample_wt_pert: bool = False):
+                 only_sample_wt_pert: bool = False,
+                 sample_once = False):
         """
         The PertTFDataset serves to interface with pytorch Dataloaders 
         Its main function is to subset and extract single samples from a single Anndata object that is in-memory
@@ -65,6 +66,8 @@ class PertTFDataset(Dataset):
             only_sample_wt_pert: only random sample next cell for wild type cells
         """
         self.adata = adata
+        self.sample_once = sample_once
+        self.cell2cell_dict = {}
         self._check_anndata_content()
         self.indices = indices if indices is not None else np.arange(len(self.adata.obs.index))
         self.expr_layer = expr_layer
@@ -221,7 +224,14 @@ class PertTFDataset(Dataset):
             current_expr = current_expr.toarray().flatten()
 
         # 3. Sample the next cell and its metadata
-        next_cell_id, next_pert_label_str = self._sample_next_cell(current_cell_idx, current_cell_celltype,  current_cell_genotype)
+        if self.sample_once:
+            if current_cell_idx in self.cell2cell_dict:
+                next_cell_id, next_pert_label_str  = self.cell2cell_dict[current_cell_idx]
+            else:
+                next_cell_id, next_pert_label_str = self._sample_next_cell(current_cell_idx, current_cell_celltype,  current_cell_genotype)
+                self.cell2cell_dict[current_cell_idx] = (next_cell_id, next_pert_label_str)
+        else:
+            next_cell_id, next_pert_label_str = self._sample_next_cell(current_cell_idx, current_cell_celltype,  current_cell_genotype)
         next_cell_global_idx = self.adata.obs.index.get_loc(next_cell_id)
         
         # 4. Get expression data for the next cell
@@ -461,13 +471,13 @@ class PertTFUniDataManager:
                 
         return data_gen
 
-    def _create_dataset_from_indices(self, indices):
+    def _create_dataset_from_indices(self, indices, sample_once = False):
         """A helper function to create PertTFDataset from underlying adata."""
         perttf_dataset = PertTFDataset(
             self.adata, indices=indices, cell_type_to_index=self.cell_type_to_index, genotype_to_index=self.genotype_to_index,
             ps_columns=self.ps_columns, ps_columns_perturbed_genes = self.ps_columns_perturbed_genes, 
-            next_cell_pred=self.next_cell_pred_type ,    additional_ps_dict = self.additional_ps_dict,  
-            expr_layer=self.expr_layer, only_sample_wt_pert=self.only_sample_wt_pert
+            next_cell_pred=self.next_cell_pred_type ,  additional_ps_dict = self.additional_ps_dict,  
+            expr_layer=self.expr_layer, only_sample_wt_pert=self.only_sample_wt_pert, sample_once=sample_once
         )
         return perttf_dataset
 
@@ -480,13 +490,13 @@ class PertTFUniDataManager:
         )
         return loader
 
-    def get_data_w_loader(self, indices = None, full_data = False, full_token = False):
+    def get_data_w_loader(self, indices = None, full_data = False, full_token = False, sample_once = False):
         indices = self.indices if indices is None and full_data else indices
-        data = self._create_dataset_from_indices(indices)
+        data = self._create_dataset_from_indices(indices, sample_once=sample_once)
         loader = self._create_loaders_from_dataset(data, full_token)
         return data, loader
 
-    def get_train_valid_loaders(self, test_size: float = 0.1, train_indices = None, valid_indices = None, full_token_validate  = False, random_state = None):
+    def get_train_valid_loaders(self, test_size: float = 0.1, train_indices = None, valid_indices = None, full_token_validate  = False, random_state = None, sample_once = False):
         """Provides a single, standard train/validation split."""
         print(f"Creating a single train/validation split (test_size={test_size})...")
         if train_indices is None or valid_indices is None:
@@ -496,8 +506,8 @@ class PertTFUniDataManager:
             if len(set(train_indices).intersection(valid_indices)) > 0:
                 print('WARNING: training data and validation data are not separate, this may be okay for perturbation if the shared samples are ctrls')
             print('overiding random train/valid split with provided indices')
-        train_data, train_loader = self.get_data_w_loader(train_indices)
-        valid_data, valid_loader = self.get_data_w_loader(valid_indices, full_token=full_token_validate)
+        train_data, train_loader = self.get_data_w_loader(train_indices, sample_once=sample_once)
+        valid_data, valid_loader = self.get_data_w_loader(valid_indices, full_token=full_token_validate, sample_once=sample_once)
         return train_data, train_loader, valid_data, valid_loader, self.get_adata_info_dict()
 
     def get_k_fold_split_loaders(self, cv = 5):

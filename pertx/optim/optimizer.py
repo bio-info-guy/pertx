@@ -80,7 +80,7 @@ def select_optimizer(optimizer, model, lr, weight_decay = 0.01):
 
 
 
-def select_scheduler(scheduler, optimizer, warmup_steps, total_steps, t0 = 1000, gamma=0.95, step_size = 1000):
+def select_scheduler(scheduler, optimizer, warmup_steps = 1, total_steps=1e9, t0 = 1000, gamma=0.95, step_size = 1000):
     # Check if we should skip scheduling (Prodigy)
     if "prodigy" in str(type(optimizer)).lower():
         print("--- Prodigy detected: Returning Identity Scheduler (No-op) ---")
@@ -90,6 +90,7 @@ def select_scheduler(scheduler, optimizer, warmup_steps, total_steps, t0 = 1000,
     remaining_steps = total_steps - warmup_steps
 
     # 1. Warmup
+
     warmup_sched = LinearLR(optimizer, start_factor=0.01, end_factor=1.0, total_iters=warmup_steps)
 
     # 2. Main Scheduler
@@ -136,7 +137,7 @@ def create_optimizer_dict(model, device, config, dataloader, num_batch_types = -
     
     scheduler = select_scheduler(scheduler=config.scheduler, 
                                  optimizer=optimizer, 
-                                 warmup_steps=config.get('warmup_steps', 5000), 
+                                 warmup_steps=config.get('warmup_steps', 5*config.epochs*len(dataloader)), 
                                  total_steps=config.epochs*len(dataloader), 
                                  t0 = config.epochs*len(dataloader)//5,
                                  gamma = config.schedule_ratio,

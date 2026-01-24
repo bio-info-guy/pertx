@@ -355,15 +355,23 @@ class PSDecoder(nn.Module):
         n_pert: int,
         nlayers: int = 3,
         activation: callable = nn.ReLU,
+        geneinput: bool = False,
     ):
         super().__init__()
         # module list
         self._decoder = nn.ModuleList()
+        if geneinput:
+            self.input_dim =  d_model * 2 #this is a concatenation of cell embedding and perturbation embedding
+        else:
+            self.input_dim = d_model # just cell embedding
+        
         for i in range(nlayers - 1):
-            self._decoder.append(nn.Linear(d_model, d_model))
-            self._decoder.append(nn.LayerNorm(d_model))
+            if i == 0:
+                self._decoder.append(nn.Linear(self.input_dim, d_model))
+            else:
+                self._decoder.append(nn.Linear(d_model, d_model))
             self._decoder.append(activation())
-            
+            self._decoder.append(nn.LayerNorm(d_model))
         self.out_layer = nn.Linear(d_model, n_pert)
 
     def forward(self, x: Tensor) -> Tensor:
@@ -420,26 +428,23 @@ class PertExpEncoder(nn.Module):
     def __init__(
         self,
         d_model: int,
-        d_pert: int
+        pert_dim: int
     ):
         super().__init__()
-        d_in = d_model + d_pert
+        d_in = d_model + pert_dim 
         #d_in = d_model
         self.fc = nn.Sequential(
             nn.Linear(d_in, d_model),
-            #nn.Sigmoid(),
-            #nn.ReLU(),
-            nn.LeakyReLU(),
+            nn.Sigmoid(),#nn.ReLU(),#nn.LeakyReLU(),
             nn.Linear(d_model, d_model),
             #nn.ReLU(),
-            #nn.Sigmoid(),
-            nn.LeakyReLU(),
+            nn.Sigmoid(),
             nn.Linear(d_model, d_model),
-            nn.LayerNorm(d_model),
+            #nn.LayerNorm(d_model),
             #nn.Linear(d_model, d_model),
         )
 
-        print(self)
+
     def forward(self, x: Tensor) -> Dict[str, Tensor]:
         """x is the output of the transformer concatenated with perturbation embedding, (batch, d_model*2)"""
         # pred_value = self.fc(x).squeeze(-1)  
@@ -591,11 +596,10 @@ class ClsDecoder(nn.Module):
         self._decoder = nn.ModuleList()
         for i in range(nlayers - 1):
             self._decoder.append(nn.Linear(d_model, d_model))
-            self._decoder.append(nn.LayerNorm(d_model)) # switched the normalization to before activation
             self._decoder.append(activation())
-            
+            self._decoder.append(nn.LayerNorm(d_model))
         self.out_layer = nn.Linear(d_model, n_cls)
-        print(self)
+
     def forward(self, x: Tensor) -> Tensor:
         """
         Args:
@@ -683,7 +687,7 @@ class MVCDecoder(nn.Module):
         d_in = d_model * 2 if use_batch_labels else d_model
         if arch_style in ["inner product", "inner product, detach"]:
             self.gene2query = nn.Linear(d_model, d_model)
-            self.query_activation = nn.LeakyReLU()#query_activation()
+            self.query_activation = query_activation()
             self.W = nn.Linear(d_model, d_in, bias=False)
             if explicit_zero_prob:  # by default, gene-wise prob rate
                 self.W_zero_logit = nn.Linear(d_model, d_in)
@@ -693,6 +697,8 @@ class MVCDecoder(nn.Module):
             self.fc1 = nn.Linear(d_model + 64, 64)
             self.hidden_activation = hidden_activation()
             self.fc2 = nn.Linear(64, 1)
+            if explicit_zero_prob:  # by default, gene-wise prob rate
+                self.W_zero_logit = nn.Linear(d_model, d_in)
         elif arch_style == "sum query":
             self.gene2query = nn.Linear(d_model, d_model)
             self.query_activation = query_activation()
@@ -716,7 +722,7 @@ class MVCDecoder(nn.Module):
         gene_embs = gene_embs.detach() if self.do_detach else gene_embs
         if self.arch_style in ["inner product", "inner product, detach"]:
             query_vecs = self.query_activation(self.gene2query(gene_embs))
-            cell_emb = self.query_activation(cell_emb.unsqueeze(2))  # (batch, embsize, 1)
+            cell_emb = cell_emb.unsqueeze(2)  # (batch, embsize, 1)
             # the pred gene expr values, # (batch, seq_len)
             pred_value = torch.bmm(self.W(query_vecs), cell_emb).squeeze(2)
             pred_value = self.expr_act(pred_value)
@@ -729,16 +735,20 @@ class MVCDecoder(nn.Module):
         elif self.arch_style == "concat query":
             query_vecs = self.query_activation(self.gene2query(gene_embs))
             # expand cell_emb to (batch, seq_len, embsize)
+            if self.explicit_zero_prob:
+                zero_logits = torch.bmm(self.W_zero_logit(query_vecs), self.query_activation(cell_emb.unsqueeze(2))).squeeze(2)
+                zero_probs = torch.sigmoid(zero_logits)
             cell_emb = cell_emb.unsqueeze(1).expand(-1, gene_embs.shape[1], -1)
-
             h = self.hidden_activation(
                 self.fc1(torch.cat([cell_emb, query_vecs], dim=2))
             )
-            if self.explicit_zero_prob:
-                raise NotImplementedError
             pred_value = self.fc2(h).squeeze(2)
             pred_value = self.expr_act(pred_value)
-            return pred_value  # (batch, seq_len)
+            if not self.explicit_zero_prob:
+                return dict(pred=pred_value)
+            else:
+                return dict(pred=pred_value, zero_probs=zero_probs)
+        
         elif self.arch_style == "sum query":
             query_vecs = self.query_activation(self.gene2query(gene_embs))
             cell_emb = cell_emb.unsqueeze(1)

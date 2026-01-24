@@ -14,7 +14,8 @@ def produce_training_datasets(adata_input, config,
                               full_token_validate = False,
                               train_val_split = 0.2,
                               train_indices = None,
-                              valid_indices = None,):
+                              valid_indices = None,
+                              sample_once = False):
     """
     produce training datasets for from scRNA-seq 
     Args:
@@ -40,6 +41,7 @@ def produce_training_datasets(adata_input, config,
     t_data, t_loader, v_data, v_loader, data_info = test_manager.get_train_valid_loaders(test_size=train_val_split, 
                                                                                          train_indices=train_indices, 
                                                                                          valid_indices=valid_indices, 
+                                                                                         sample_once=sample_once,
                                                                                          full_token_validate=full_token_validate,
                                                                                          random_state = random_state)             
     data_info['train_loader'] = t_loader

@@ -102,6 +102,7 @@ def train(model: nn.Module,
         perturbation_labels_next = batch_data["perturbation_labels_next"].to(device) #added
 
         mvc_src = None if config.get('mvc_masked_train', True) else batch_data['full_gene_ids'].to(device)
+        mvc_val = None if config.get('mvc_masked_train', True) else batch_data["full_expr"].to(device)
         if config.ps_weight >0:
             ps_score = batch_data["ps"].to(device)
             ps_score_next = batch_data["ps_next"].to(device) #
@@ -113,6 +114,7 @@ def train(model: nn.Module,
             output_dict = model(
                 input_gene_ids,
                 input_values,
+                target_values,
                 src_key_padding_mask=src_key_padding_mask,
                 batch_labels=batch_labels if config.use_batch_label else None, # if config.DSBN else None,
                 pert_labels = perturbation_labels if config.perturbation_input else None,
@@ -123,7 +125,8 @@ def train(model: nn.Module,
                 CCE = config.CCE,
                 PERTPRED = config.get('genotype_classifier', True),
                 PSPRED = config.ps_weight >0,
-                mvc_src = mvc_src
+                mvc_src = mvc_src,
+                mvc_val = mvc_val
             )
 
             masked_positions = input_values.eq(config.mask_value)  # the postions to predict
@@ -181,7 +184,7 @@ def train(model: nn.Module,
                     loss += loss_cce_genotype * max(config.perturbation_classifier_weight,1)
 
             if config.GEPC:
-                mvc_target_values = target_values if config.get('mvc_masked_train', True) else batch_data["full_expr"].to(device)
+                mvc_target_values = target_values if config.get('mvc_masked_train', True) else mvc_val
                 mvc_target_values_next = target_values_next if config.get('mvc_masked_train', True) else batch_data["full_expr_next"].to(device)
                 mvc_masked_positions = masked_positions if config.get('mvc_masked_train', True) else None
                 loss_gepc = criterion(
@@ -475,6 +478,7 @@ def evaluate(model: nn.Module,
                 output_dict = model(
                     input_gene_ids,
                     input_values,
+                    target_values,
                     src_key_padding_mask=src_key_padding_mask,
                     batch_labels=batch_labels if config.use_batch_label else None, # if config.DSBN else None,
                     pert_labels = perturbation_labels if config.perturbation_input else None,
@@ -687,8 +691,10 @@ def eval_testdata(
     if mvc_full_expr: # if we want to get full expression from mvc decoder
         cls_gene_ids = np.insert(gene_ids, 0, vocab[config.cls_token]) # default should always be to insert a cls token at the front
         full_gene_ids = torch.stack([torch.from_numpy(cls_gene_ids).long() for i in range(adata_t.shape[0])], dim = 0)
+        full_val = torch.Tensor(np.hstack([np.array([-3 for i in range(adata_t.shape[0])]).reshape(-1,1), all_counts]))
     else:
         full_gene_ids = None
+        full_val = None
     # Evaluate cls cell embeddings
     if "cls" in include_types:
         sampling_mode = config.get('sampling_mode', 'simple')
@@ -751,17 +757,28 @@ def eval_testdata(
             #    time_step=0,
             #    return_np=True,
             #)
-            cell_embeddings, cell_embeddings_next, pert_preds, cls_preds, ps_preds, ps_preds_next, expr_dict = model.encode_batch_with_perturb(all_gene_ids,all_values.float(),
-                src_key_padding_mask=src_key_padding_mask,
-                batch_size=config.batch_size,
-                batch_labels=torch.from_numpy(batch_ids).long() if config.use_batch_label else None, # if config.DSBN else None,
-                pert_labels = torch.from_numpy(perturbation_indexes).long() if config.perturbation_input else None,
-                pert_labels_next = torch.from_numpy(perturbation_indexes_next).long() if next_cell_prediction else None,
-                time_step=0,
-                return_np=True,
-                predict_expr = predict_expr,
-                mvc_src = full_gene_ids
-            )
+                (
+                cell_embeddings, 
+                cell_embeddings_next, 
+                pert_preds, 
+                cls_preds, 
+                ps_preds, 
+                ps_preds_next, 
+                expr_dict
+                ) = model.encode_batch_with_perturb(
+                    all_gene_ids,
+                    all_values.float(),
+                    src_key_padding_mask=src_key_padding_mask,
+                    batch_size=config.batch_size,
+                    batch_labels=torch.from_numpy(batch_ids).long() if config.use_batch_label else None, # if config.DSBN else None,
+                    pert_labels = torch.from_numpy(perturbation_indexes).long() if config.perturbation_input else None,
+                    pert_labels_next = torch.from_numpy(perturbation_indexes_next).long() if next_cell_prediction else None,
+                    time_step=0,
+                    return_np=True,
+                    predict_expr = predict_expr,
+                    mvc_src = full_gene_ids,
+                    mvc_val = full_val,
+                )
 
         cell_embeddings = cell_embeddings / np.linalg.norm(
             cell_embeddings, axis=1, keepdims=True
