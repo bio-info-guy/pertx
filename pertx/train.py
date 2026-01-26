@@ -139,7 +139,7 @@ def train(model: nn.Module,
                 loss_mse = criterion(
                     output_dict["mlm_output"][positions], target_values[positions], masked_positions
                 )
-                loss = config.this_weight * loss_mse
+                loss = config.mlm_weight * loss_mse
                 metrics_to_log = {"train/mse": loss_mse.item()}
                 # next value?
                 loss_mse_next = criterion(
@@ -153,7 +153,7 @@ def train(model: nn.Module,
                     loss_zero_log_prob = criterion_neg_log_bernoulli(
                         output_dict["mlm_zero_probs"][positions], target_values[positions], masked_positions
                     )
-                    loss = loss + config.this_weight *loss_zero_log_prob
+                    loss = loss + config.mlm_weight *loss_zero_log_prob
                     metrics_to_log.update({"train/nzlp": loss_zero_log_prob.item()})
                     # added
                     loss_zero_log_prob_next = criterion_neg_log_bernoulli(
@@ -190,20 +190,20 @@ def train(model: nn.Module,
                 loss_gepc = criterion(
                     output_dict["mvc_output"][positions], mvc_target_values[positions], mvc_masked_positions
                 )
-                loss = loss + config.this_weight *loss_gepc
+                loss = loss + config.mvc_weight *loss_gepc
                 metrics_to_log.update({"train/mvc": loss_gepc.item()})
                 # added
                 loss_gepc_next = criterion(
                     output_dict["mvc_output_next"][positions], mvc_target_values_next[positions], mvc_masked_positions
                 )
-                loss = loss + config.next_weight * loss_gepc_next
+                loss = loss + config.mvc_next_weight * loss_gepc_next
                 metrics_to_log.update({"train/mvc_next": loss_gepc_next.item()})
                 
                 if config.explicit_zero_prob:
                     loss_gepc_zero_log_prob = criterion_neg_log_bernoulli(
                         output_dict["mvc_zero_probs"][positions], mvc_target_values[positions], mvc_masked_positions
                     )
-                    loss = loss + config.this_weight *loss_gepc_zero_log_prob
+                    loss = loss + config.mvc_weight *loss_gepc_zero_log_prob
                     metrics_to_log.update(
                         {"train/mvc_nzlp": loss_gepc_zero_log_prob.item()}
                     )
@@ -211,7 +211,7 @@ def train(model: nn.Module,
                     loss_gepc_zero_log_prob_next = criterion_neg_log_bernoulli(
                         output_dict["mvc_zero_probs_next"][positions], mvc_target_values_next[positions], mvc_masked_positions
                     )
-                    loss = loss + config.next_weight * loss_gepc_zero_log_prob_next
+                    loss = loss + config.mvc_next_weight * loss_gepc_zero_log_prob_next
                     metrics_to_log.update(
                         {"train/mvc_nzlp_next": loss_gepc_zero_log_prob_next.item()}
                     )
@@ -258,6 +258,7 @@ def train(model: nn.Module,
                 loss_dab = criterion_dab(output_dict["dab_output"], batch_labels)
                 loss = loss + config.dab_weight * loss_dab
                 metrics_to_log.update({"train/dab": loss_dab.item()})
+
             if config.get('link_loss', None) is not None and all_edges is not None:
                 if config.get('link_loss', None) == 'hard':
                     loss_struct = compute_hard_negative_link_loss(output_dict["pert_emb"]['final_embs'], all_edges, batch_size=20000)
@@ -265,6 +266,7 @@ def train(model: nn.Module,
                     loss_struct = compute_margin_link_loss(output_dict["pert_emb"]['final_embs'], all_edges, batch_size=20000)
                 loss = loss + 0.1 * loss_struct
                 metrics_to_log.update({"train/struct": loss_struct.item()})
+                
         model.zero_grad()
         #print(f"loss: {loss}")
         #import pdb; pdb.set_trace()

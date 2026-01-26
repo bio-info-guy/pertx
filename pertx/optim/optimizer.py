@@ -137,7 +137,7 @@ def create_optimizer_dict(model, device, config, dataloader, num_batch_types = -
     
     scheduler = select_scheduler(scheduler=config.scheduler, 
                                  optimizer=optimizer, 
-                                 warmup_steps=config.get('warmup_steps', 5*config.epochs*len(dataloader)), 
+                                 warmup_steps=config.get('warmup_steps', 5*len(dataloader)), 
                                  total_steps=config.epochs*len(dataloader), 
                                  t0 = config.epochs*len(dataloader)//5,
                                  gamma = config.schedule_ratio,
