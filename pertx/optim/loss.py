@@ -204,7 +204,9 @@ def SUPCON_loss(features, labels=None, mask=None, contrast_mode = 'all', tempera
     return loss
 
 # wrapper function to calculate cce loss on pertTF outputs contrastive dictionary
-def cce_loss(contrastive_dict, input_labels, pert_labels, logit_norm = False):
+def cce_loss(contrastive_dict, input_labels, pert_labels, logit_norm = False, positions = None):
+    if positions == None:
+        positions = torch.ones(input_labels.size(0), dtype=torch.bool, device=input_labels.device)
     loss_cce = 0
     if len(contrastive_dict) == 4:
         loss_cce += perturb_embedding_loss(
@@ -216,8 +218,8 @@ def cce_loss(contrastive_dict, input_labels, pert_labels, logit_norm = False):
             lambda_rev=5
         ) 
     contr_keys = list(contrastive_dict.keys())
-    emb_list = [contrastive_dict[k] for k in contr_keys]
-    lab_list = [input_labels if 'orig' in k else pert_labels for k in contr_keys]
+    emb_list = [contrastive_dict[k] if 'orig' in k else contrastive_dict[k][positions] for k in contr_keys]
+    lab_list = [input_labels if 'orig' in k else pert_labels[positions] for k in contr_keys]
     loss_cce += SUPCON_loss(
         features = torch.concat(emb_list, dim = 0).unsqueeze(1), 
         labels = torch.concat(lab_list),

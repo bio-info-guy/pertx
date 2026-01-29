@@ -150,8 +150,8 @@ class PertTFGraphModel(BaseModel):
         # add additional perturbs
         if input_pert_flags is not None:
             perts = self.pert_encoder(input_pert_flags)  # (batch, seq_len, embsize)
-            if isinstance(perts, tuple):
-                perts = perts[0] # Take only the fused embedding
+            if isinstance(perts, dict):
+                perts = perts['final_embs'] # Take only the fused embedding
             #import pdb; pdb.set_trace()
             perts_expand = perts.unsqueeze(1).repeat(1, total_embs.shape[1], 1)
             total_embs = total_embs + perts_expand
@@ -269,10 +269,12 @@ class PertTFGraphModel(BaseModel):
             #import pdb; pdb.set_trace()
             #print(pert_embeddings['final_embs'].shape)
             #print(pert_labels_next)
-            pert_emb_next = self.pert_encoder(pert_labels_next)
+            pert_emb_next = self.pert_encoder(pert_labels_next) if self.pert_graph is None else self.pert_encoder()
             #self.pert_encoder(pert_labels_next)
-            if isinstance(pert_emb_next, tuple):
-                pert_emb_next = pert_emb_next[0]
+            if isinstance(pert_emb_next, dict):
+                output['pert_emb'] = pert_emb_next
+                pert_emb_next = pert_emb_next['final_embs'][pert_labels_next]
+                
             tf_concat=torch.cat(
                 [
                     cell_emb_orig,
@@ -471,8 +473,8 @@ class PertTFGraphModel(BaseModel):
             tf_concat = None
             if pert_labels_next_d is not None:
                 pert_emb_next = self.pert_encoder(pert_labels_next_d)
-                if isinstance(pert_emb_next, tuple):
-                    pert_emb_next = pert_emb_next[0]
+                if isinstance(pert_emb_next, dict):
+                    pert_emb_next = pert_emb_next['final_embs']
                 tf_concat=torch.cat(
                     [cell_emb,pert_emb_next], dim=1,
                 )

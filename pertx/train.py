@@ -103,6 +103,7 @@ def train(model: nn.Module,
 
         mvc_src = None if config.get('mvc_masked_train', True) else batch_data['full_gene_ids'].to(device)
         mvc_val = None if config.get('mvc_masked_train', True) else batch_data["full_expr"].to(device)
+
         if config.ps_weight >0:
             ps_score = batch_data["ps"].to(device)
             ps_score_next = batch_data["ps_next"].to(device) #
@@ -132,32 +133,32 @@ def train(model: nn.Module,
             masked_positions = input_values.eq(config.mask_value)  # the postions to predict
             
             if config.get('pert_ctrl_only', False):
-                positions = (perturbation_labels != perturbation_labels_next) | (perturbation_labels != ctrl_pert_index)
+                positions = (perturbation_labels != perturbation_labels_next)
             else:
                 positions = torch.ones(input_values.size(0), dtype=torch.bool, device=input_values.device)
             if config.get('MLM', True):
                 loss_mse = criterion(
-                    output_dict["mlm_output"][positions], target_values[positions], masked_positions
+                    output_dict["mlm_output"], target_values, masked_positions
                 )
                 loss = config.mlm_weight * loss_mse
                 metrics_to_log = {"train/mse": loss_mse.item()}
                 # next value?
                 loss_mse_next = criterion(
                     output_dict["mlm_output"][positions],
-                    target_values_next[positions], masked_positions
+                    target_values_next[positions], masked_positions[positions]
                 )
                 # disable now
                 #loss = loss + config.next_weight * loss_mse_next
                 metrics_to_log.update({"train/mse_next": loss_mse_next.item()})
                 if config.explicit_zero_prob:
                     loss_zero_log_prob = criterion_neg_log_bernoulli(
-                        output_dict["mlm_zero_probs"][positions], target_values[positions], masked_positions
+                        output_dict["mlm_zero_probs"], target_values, masked_positions
                     )
                     loss = loss + config.mlm_weight *loss_zero_log_prob
                     metrics_to_log.update({"train/nzlp": loss_zero_log_prob.item()})
                     # added
                     loss_zero_log_prob_next = criterion_neg_log_bernoulli(
-                        output_dict["mlm_zero_probs"][positions], target_values_next[positions], masked_positions
+                        output_dict["mlm_zero_probs"][positions], target_values_next[positions], masked_positions[positions]
                     )
                     #loss = loss + config.next_weight *loss_zero_log_prob_next
                     metrics_to_log.update({"train/nzlp_next": loss_zero_log_prob_next.item()})
@@ -169,39 +170,39 @@ def train(model: nn.Module,
                     cce_weight = max(config.perturbation_classifier_weight*config.cell_type_classifier_weight, 1)
                     input_labels = celltype_labels*1000+perturbation_labels # x1000 make labels unique combination of celltype and genotype
                     pert_labels = celltype_labels_next*1000+perturbation_labels_next
-                    loss_cce = cce_loss(output_dict["contrastive_dict"], input_labels, pert_labels, logit_norm=logit_norm)
+                    loss_cce = cce_loss(output_dict["contrastive_dict"], input_labels, pert_labels, logit_norm=logit_norm, positions=positions)
                     metrics_to_log["train/cce"] = loss_cce.item()
                     loss += loss_cce * cce_weight
 
                 if cce_mode == 'celltype' or cce_mode == 'cell+geno':
-                    loss_cce_celltype = cce_loss(output_dict["contrastive_dict"], celltype_labels, celltype_labels_next, logit_norm=logit_norm)
+                    loss_cce_celltype = cce_loss(output_dict["contrastive_dict"], celltype_labels, celltype_labels_next, logit_norm=logit_norm, positions=positions)
                     metrics_to_log["train/cce_celltype"] = loss_cce_celltype.item()
                     loss += loss_cce_celltype * max(config.cell_type_classifier_weight, 1)
 
                 if cce_mode == 'genotype' or cce_mode == 'cell+geno':
-                    loss_cce_genotype = cce_loss(output_dict["contrastive_dict"], perturbation_labels, perturbation_labels_next, logit_norm=logit_norm)
+                    loss_cce_genotype = cce_loss(output_dict["contrastive_dict"], perturbation_labels, perturbation_labels_next, logit_norm=logit_norm, positions=positions)
                     metrics_to_log["train/cce_genotype"] = loss_cce_genotype.item()
                     loss += loss_cce_genotype * max(config.perturbation_classifier_weight,1)
 
             if config.GEPC:
                 mvc_target_values = target_values if config.get('mvc_masked_train', True) else mvc_val
                 mvc_target_values_next = target_values_next if config.get('mvc_masked_train', True) else batch_data["full_expr_next"].to(device)
-                mvc_masked_positions = masked_positions if config.get('mvc_masked_train', True) else None
+                mvc_masked_positions = masked_positions if config.get('mvc_masked_train', True) else torch.zeros_like(input_values)
                 loss_gepc = criterion(
-                    output_dict["mvc_output"][positions], mvc_target_values[positions], mvc_masked_positions
+                    output_dict["mvc_output"], mvc_target_values, mvc_masked_positions
                 )
                 loss = loss + config.mvc_weight *loss_gepc
                 metrics_to_log.update({"train/mvc": loss_gepc.item()})
                 # added
                 loss_gepc_next = criterion(
-                    output_dict["mvc_output_next"][positions], mvc_target_values_next[positions], mvc_masked_positions
+                    output_dict["mvc_output_next"][positions], mvc_target_values_next[positions], mvc_masked_positions[positions]
                 )
                 loss = loss + config.mvc_next_weight * loss_gepc_next
                 metrics_to_log.update({"train/mvc_next": loss_gepc_next.item()})
                 
                 if config.explicit_zero_prob:
                     loss_gepc_zero_log_prob = criterion_neg_log_bernoulli(
-                        output_dict["mvc_zero_probs"][positions], mvc_target_values[positions], mvc_masked_positions
+                        output_dict["mvc_zero_probs"], mvc_target_values, mvc_masked_positions
                     )
                     loss = loss + config.mvc_weight *loss_gepc_zero_log_prob
                     metrics_to_log.update(
@@ -209,7 +210,7 @@ def train(model: nn.Module,
                     )
                     # added
                     loss_gepc_zero_log_prob_next = criterion_neg_log_bernoulli(
-                        output_dict["mvc_zero_probs_next"][positions], mvc_target_values_next[positions], mvc_masked_positions
+                        output_dict["mvc_zero_probs_next"][positions], mvc_target_values_next[positions], mvc_masked_positions[positions]
                     )
                     loss = loss + config.mvc_next_weight * loss_gepc_zero_log_prob_next
                     metrics_to_log.update(
@@ -220,7 +221,7 @@ def train(model: nn.Module,
                 loss = loss + config.cell_type_classifier_weight * loss_cls
                 metrics_to_log.update({"train/cls": loss_cls.item()})
                 # add for next cls prediction
-                loss_cls_next = criterion_cls(output_dict["cls_output_next"], celltype_labels_next)
+                loss_cls_next = criterion_cls(output_dict["cls_output_next"][positions], celltype_labels_next[positions])
                 loss = loss + config.cell_type_classifier_weight * config.next_weight *  loss_cls_next
                 metrics_to_log.update({"train/cls_next": loss_cls_next.item()})
 
@@ -235,7 +236,7 @@ def train(model: nn.Module,
                 loss = loss + config.perturbation_classifier_weight * loss_pert
                 metrics_to_log.update({"train/pert": loss_pert.item()})
                 # add for next pert prediction
-                loss_pert_next = criterion_pert(output_dict["pert_output_next"], perturbation_labels_next)
+                loss_pert_next = criterion_pert(output_dict["pert_output_next"][positions], perturbation_labels_next[positions])
                 loss = loss + config.perturbation_classifier_weight * config.next_weight * loss_pert_next
                 metrics_to_log.update({"train/pert_next": loss_pert_next.item()})
 
@@ -245,7 +246,7 @@ def train(model: nn.Module,
                 #print(f"loss_ps: {loss_ps}")
                 loss = loss + config.ps_weight * loss_ps
                 metrics_to_log.update({"train/ps": loss_ps.item()})
-                loss_ps_next = criterion_ps(output_dict["ps_output_next"], ps_score_next)
+                loss_ps_next = criterion_ps(output_dict["ps_output_next"][positions], ps_score_next[positions])
                 loss = loss + ps_next_training_weight * loss_ps_next 
                 metrics_to_log.update({"train/ps_next": loss_ps_next.item()})
 
@@ -259,8 +260,8 @@ def train(model: nn.Module,
                 loss = loss + config.dab_weight * loss_dab
                 metrics_to_log.update({"train/dab": loss_dab.item()})
 
-            if config.get('link_loss', None) is not None and all_edges is not None:
-                if config.get('link_loss', None) == 'hard':
+            if config.get('link_loss', False) and all_edges is not None:
+                if config.get('link_loss', False) == 'hard':
                     loss_struct = compute_hard_negative_link_loss(output_dict["pert_emb"]['final_embs'], all_edges, batch_size=20000)
                 else:
                     loss_struct = compute_margin_link_loss(output_dict["pert_emb"]['final_embs'], all_edges, batch_size=20000)
@@ -476,6 +477,7 @@ def evaluate(model: nn.Module,
             
             src_key_padding_mask = input_gene_ids.eq(vocab[config.pad_token])
             mvc_src = None if config.get('mvc_masked_train', True) else batch_data['full_gene_ids'].to(device)
+            mvc_val = None if config.get('mvc_masked_train', True) else batch_data["full_expr"].to(device)
             with torch.cuda.amp.autocast(enabled=config.amp):
                 output_dict = model(
                     input_gene_ids,
@@ -490,7 +492,8 @@ def evaluate(model: nn.Module,
                     CLS=config.get('cell_type_classifier', True),
                     PERTPRED = config.get('genotype_classifier', True),
                     PSPRED = config.ps_weight>0,
-                    mvc_src = mvc_src
+                    mvc_src = mvc_src,
+                    mvc_val = mvc_val
                 )
                 output_values = output_dict["mlm_output"]
 

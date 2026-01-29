@@ -188,5 +188,5 @@ class LearnableWeightedRGCN2(nn.Module):
         final = self.final_norm(final_global)
         
         if target_node_indices is not None:
-            return final[target_node_indices], attn_weights, x_all
-        return final, attn_weights, x_all
+            return {'final_embs':final[target_node_indices], 'attn_weights':attn_weights,'init_embs': x_all}
+        return {'final_embs':final, 'attn_weights':attn_weights,'init_embs': x_all}
