@@ -66,6 +66,7 @@ class BaseModel(nn.Module):
         gene_emb_dim: int = 512,
         cross_attn_decoder: bool = False,
         decoder_layer: bool = False,
+        **kwargs
     ):
         super().__init__()
         self.model_type = "Transformer"

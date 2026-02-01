@@ -1,6 +1,6 @@
 from typing import List, Tuple, Dict, Union, Optional, Literal
-import time
-import copy
+import os
+import pickle
 from operator import itemgetter
 from sklearn.model_selection import train_test_split, KFold
 import torch
@@ -15,6 +15,8 @@ import anndata
 from scipy.sparse import issparse
 from sklearn.model_selection._split import _BaseKFold
 from ..tokenizer.custom_tokenizer import tokenize_and_pad_batch, random_mask_value, MasterVocab
+from ..sampler.ot import compute_ot_for_subset
+
 
 def add_batch_info(adata):
     """helper function to add batch effect columns into adata"""
@@ -34,11 +36,18 @@ Pass train_loader, valid_loader and data_gen to the wrapper_train either once or
 
 class PertTFDataset(Dataset):
     """
-    A PyTorch Dataset for AnnData objects that performs next-cell sampling on the fly.
+    A PyTorch Dataset for AnnData objects with Integrated Optimal Transport Sampling.
     """
     def __init__(self, 
-                 adata: AnnData, 
+                 adata, 
                  indices: np.ndarray = None, 
+                 # OT Parameters
+                 use_ot: bool = False,
+                 ot_pickle_path: str = None,
+                 ot_top_k: int = 10,
+                 ot_epsilon: Union[float, str] = "auto",
+                 ot_max_dist: Union[float, str] = "auto",
+                 # Standard Parameters
                  cell_type_to_index: dict = None, 
                  genotype_to_index: dict = None, 
                  expr_layer: str = 'X_binned',
@@ -48,76 +57,87 @@ class PertTFDataset(Dataset):
                  additional_ps_dict: dict = None, 
                  only_sample_wt_pert: bool = False,
                  sample_once = False):
-        """
-        The PertTFDataset serves to interface with pytorch Dataloaders 
-        Its main function is to subset and extract single samples from a single Anndata object that is in-memory
-        customized with the ability to sample a Perturbed sample for "WT" samples.
-
-        Args:
-            adata (AnnData): The full AnnData object, may be shared by multiple objects.
-            indices (np.ndarray): The indices of the adata object that belong to this dataset (e.g., train or valid).
-            config (object): A configuration object with parameters like 'binned_layer_key'.
-            cell_type_to_index (dict): Mapping from cell type string to integer index.
-            genotype_to_index (dict): Mapping from genotype string to integer index.
-            ps_columns (list, optional): List of columns in obs to use for 'ps' scores.
-            ps_columns_perturbed_genes (list, optional): List of perturbed genes for ps_columns. Only active if next_cell_red is "lochness". Have to be have the same length as ps_columns.
-            next_cell_pred (str): The mode for next cell prediction ("identity" or "pert" or "lochness").
-            additional_ps_dict (dict): a dictionary {gene_name:ps} the pass the additional ps score for other genes to the training.
-            only_sample_wt_pert: only random sample next cell for wild type cells
-        """
+        
         self.adata = adata
         self.sample_once = sample_once
         self.cell2cell_dict = {}
         self._check_anndata_content()
         self.indices = indices if indices is not None else np.arange(len(self.adata.obs.index))
+        
+        # OT Configuration
+        self.use_ot = use_ot
+        self.ot_pickle_path = ot_pickle_path
+        self.ot_top_k = ot_top_k
+        self.ot_epsilon = ot_epsilon
+        self.ot_max_dist = ot_max_dist
+        self.ot_cache = {} # Holds the map for the CURRENT indices
+        
         self.expr_layer = expr_layer
         self.next_cell_pred = next_cell_pred
+
         # Mappings
         self.cell_type_to_index = cell_type_to_index if cell_type_to_index is not None else {t: i for i, t in enumerate(self.adata.obs['celltype'].unique())}
         self.genotype_to_index = genotype_to_index if genotype_to_index is not None else {t: i for i, t in enumerate(self.adata.obs['genotype'].unique())}
-        self.ps_columns = ps_columns or [] 
-        self.ps_columns = list(self.ps_columns) 
-        # must be a list 
-        # For efficient next-cell sampling, pre-compute a dictionary of valid choices
-        # IMPORTANT: This dictionary only contains cells from the current data split (train/valid)
-        # to prevent data leakage.
+        
+        # PS Scores Setup
+        self.ps_columns = list(ps_columns) if ps_columns else []
+        
+        
+        # Handle Lochness specific setup
+
+        # Initialize pools and OT
         self.next_cell_dict = self._create_next_cell_pool()
         self.only_sample_wt_pert = only_sample_wt_pert
 
         if self.next_cell_pred == "lochness":
-            if ps_columns is None:
-                raise ValueError("PS columns must be provided for lochness prediction")
-            if len(ps_columns) != len(ps_columns_perturbed_genes):
-                raise ValueError("The ps_columns_perturbed_genes must be specified and has to have equal length as ps_columns")
-            #perturbation_labels_uniq = np.unique(perturbation_labels_0)
-            ps_columns_perturbed_genes = [x for x in ps_columns_perturbed_genes if x in self.genotype_to_index]
-            if len(ps_columns_perturbed_genes) != len(ps_columns):
-                print('Specified perturbed genes for PS column after filtering:' + ','.join(ps_columns_perturbed_genes))
-                raise ValueError("The ps_columns_perturbed_genes must be specified and has to have equal length as ps_matrix")
-            self.ps_columns_perturbed_genes = ps_columns_perturbed_genes
-
-            if additional_ps_dict is None:
-                self.additional_ps_dict={}
-                self.additional_ps_names=[]
-            else:
-                self.additional_ps_dict = additional_ps_dict
-                self.additional_ps_names = list(additional_ps_dict.keys())
-                # sanity check: whether the gene keys are part of the genotype_to_index
-                for x in self.additional_ps_names:
-                    if x not in self.genotype_to_index:
-                        raise ValueError(f"The gene name {x} provided in additional_ps_dict is not included in the pre-defined genotype.")
-            
-        # store the ps_matrix as numpy array for fast retrival during training
+            self._setup_lochness(ps_columns, ps_columns_perturbed_genes, additional_ps_dict)
         self.ps_matrix = self.adata.obs[self.ps_columns].values.astype(np.float32) if self.ps_columns else np.zeros((self.adata.shape[0],1), dtype=np.float32)
+        # Trigger initial OT calculation if enabled
+        if self.use_ot and self.next_cell_pred == "pert":
+            self._recalculate_ot()
+
+    def _setup_lochness(self, ps_columns, ps_columns_perturbed_genes, additional_ps_dict):
+        """Helper to organize Lochness config."""
+        if ps_columns is None:
+             raise ValueError("PS columns must be provided for lochness prediction")
+        if len(ps_columns) != len(ps_columns_perturbed_genes):
+            raise ValueError("ps_columns_perturbed_genes length mismatch")
+        
+        ps_columns_perturbed_genes = [x for x in ps_columns_perturbed_genes if x in self.genotype_to_index]
+        if len(ps_columns_perturbed_genes) != len(ps_columns):
+            print('Specified perturbed genes for PS column after filtering:' + ','.join(ps_columns_perturbed_genes))
+            raise ValueError("The ps_columns_perturbed_genes must be specified and has to have equal length as ps_matrix")
+        self.ps_columns_perturbed_genes = ps_columns_perturbed_genes
+
+        if additional_ps_dict is None:
+            self.additional_ps_dict={}
+            self.additional_ps_names=[]
+        else:
+            self.additional_ps_dict = additional_ps_dict
+            self.additional_ps_names = list(additional_ps_dict.keys())
+            for x in self.additional_ps_names:
+                if x not in self.genotype_to_index:
+                    raise ValueError(f"Gene {x} in additional_ps_dict not in genotype index.")
 
     def _check_anndata_content(self):
         assert 'genotype' in self.adata.obs.columns and 'celltype' in self.adata.obs.columns, 'no genotype or celltype column found in anndata'
         add_batch_info(self.adata)
-        
+
     def set_new_indices(self, indices, next_cell_pool = True):
+        """
+        Public method to update the dataset split (e.g. for K-Fold).
+        Automatically recalculates OT maps for the new subset.
+        """
         self.indices = indices
+        # Clear per-epoch static cache if it exists
+        self.cell2cell_dict = {} 
+        
         if next_cell_pool:
             self.next_cell_dict = self._create_next_cell_pool()
+
+        if self.use_ot and self.next_cell_pred == "pert":
+            print(f"--- Indices Updated (N={len(indices)}). Recalculating OT Maps... ---")
+            self._recalculate_ot()
 
     def get_adata_subset(self, next_cell_pred = 'identity'):
         assert next_cell_pred in ['pert', 'identity', "lochness"], 'next_cell_pred can only be identity or pert or lochness'
@@ -145,134 +165,172 @@ class PertTFDataset(Dataset):
             adata_small.obs['next_cell_id'] = next_cell_id_list
             adata_small.layers['next_expr'] = self.adata.layers[self.expr_layer][next_cell_global_idx_list]
         return adata_small
+    
+
+    def _recalculate_ot(self):
+        # 1. Create View
+        adata_subset = self.adata[self.indices]
+        
+        # --- NEW: Auto-Calibration Logic ---
+        current_threshold = self.ot_max_dist
+        
+        # -----------------------------------
+
+        # 2. Compute Maps (Pass the calculated threshold)
+        new_maps = compute_ot_for_subset(
+            adata_subset, 
+            top_k=self.ot_top_k, 
+            epsilon=self.ot_epsilon,
+            max_dist_sq=current_threshold, # <--- Use the variable, not self.ot_max_dist
+            pca_key='X_pca'
+        )
+        
+        # 3. Update Cache & Pickle (Same as before)
+        self.ot_cache = new_maps
+        
+        if self.ot_pickle_path:
+            full_cache = {}
+            if os.path.exists(self.ot_pickle_path):
+                try:
+                    with open(self.ot_pickle_path, 'rb') as f:
+                        full_cache = pickle.load(f)
+                except Exception:
+                    pass # handle read error
+            
+            full_cache.update(new_maps)
+            try:
+                with open(self.ot_pickle_path, 'wb') as f:
+                    pickle.dump(full_cache, f)
+            except Exception as e:
+                print(f"Warning: Could not save OT pickle: {e}")
+
 
     def __len__(self):
         return len(self.indices)
 
     def _create_next_cell_pool(self):
-        """Pre-computes a dictionary for fast sampling of the next cell."""
+        """Pre-computes a dictionary for fast sampling of random cells."""
         if self.next_cell_pred != "pert":
             return None
             
         next_cell_dict = {}
-        # Use only the subset of adata relevant to this dataset split
+        # View of the current subset
         obs_subset = self.adata.obs.iloc[self.indices]
         
         for cell_type in obs_subset['celltype'].unique():
             next_cell_dict[cell_type] = {}
             for genotype in obs_subset['genotype'].unique():
-                # Find cells matching the criteria within the current split
+                # Get names of cells matching criteria
                 mask = (obs_subset['celltype'] == cell_type) & (obs_subset['genotype'] == genotype)
                 included_cells_indices = obs_subset[mask].index.tolist()
                 if included_cells_indices:
                     next_cell_dict[cell_type][genotype] = included_cells_indices
         return next_cell_dict
 
-    def _sample_next_cell(self,  current_cell_idx, current_cell_celltype, current_cell_genotype):
-        """Samples a 'next cell' for a given current cell."""
-        #current_cell_id = current_cell_obs.name
-        #current_cell_type = current_cell_obs['celltype']
-        #current_genotype = current_cell_obs['genotype']
-
-        current_cell_id = current_cell_idx
-        current_cell_type = current_cell_celltype
-        current_genotype = current_cell_genotype
-
+    def _sample_next_cell(self, current_cell_idx, current_cell_celltype, current_cell_genotype):
+        """
+        Selects the next cell pair. 
+        current_cell_idx: String (Cell Name)
+        """
         if self.next_cell_pred == "identity" or self.next_cell_pred == "lochness":
-            return current_cell_id, current_genotype
+            return current_cell_idx, current_cell_genotype
 
-        # Logic for perturbation prediction
-        valid_genotypes = self.next_cell_dict.get(current_cell_type, {})
-        if not valid_genotypes:
-             return current_cell_id, current_genotype # Fallback
+        # 1. Determine Target Genotype
+        valid_genotypes = self.next_cell_dict.get(current_cell_celltype, {})
+        if not valid_genotypes: return current_cell_idx, current_cell_genotype 
 
-        if current_genotype == 'WT':
-            # Randomly select a different genotype
+        if current_cell_genotype == 'WT':
+            # WT cells try to map to a random perturbation
             next_pert_value = random.choice(list(valid_genotypes.keys()))
         else:
-            # For non-WT, the "next" state is the same perturbation
-            next_pert_value = current_genotype
+            # Perturbed cells map to themselves (logic handled later)
+            next_pert_value = current_cell_genotype
 
-        if next_pert_value == current_genotype and self.only_sample_wt_pert:
-            return current_cell_id, next_pert_value
+        # 2. OT Sampling (WT -> Perturbation only)
+        if self.use_ot and current_cell_genotype == 'WT' and next_pert_value != 'WT':
+            # Check if we have a valid OT map for this specific cell and target
+            if current_cell_idx in self.ot_cache:
+                if next_pert_value in self.ot_cache[current_cell_idx]:
+                    candidates, weights = self.ot_cache[current_cell_idx][next_pert_value]
+                    # Sample weighted choice
+                    next_cell_id = random.choices(candidates, weights=weights, k=1)[0]
+                    return next_cell_id, next_pert_value
+                else:
+                    return current_cell_idx, current_cell_genotype
+            else:
+                return current_cell_idx, current_cell_genotype
+        # 3. Fallback / Standard Logic
+        if next_pert_value == current_cell_genotype and self.only_sample_wt_pert:
+            # Perturbed cells (or WT mapped to WT) return themselves
+            return current_cell_idx, next_pert_value
         else:
-            # Sample a random cell with the target cell type and genotype
-            possible_next_cells = valid_genotypes.get(next_pert_value, [current_cell_id])
+            # Random sampling from the pool
+            possible_next_cells = valid_genotypes.get(next_pert_value, [current_cell_idx])
             next_cell_id = random.choice(possible_next_cells)
             return next_cell_id, next_pert_value
-    
     def __getitem__(self, idx: int):
-        """
-        Retrieves one sample from the dataset. This is where on-the-fly processing happens.
-        """
-
-        # 1. Get the index for the current cell
+        # 1. Get Global Index and Metadata
         current_cell_global_idx = self.indices[idx]
-
-        #current_cell_obs = self.adata.obs.iloc[current_cell_global_idx] # too slow
-
-        current_cell_idx = self.adata.obs.index[current_cell_global_idx]
+        current_cell_idx = self.adata.obs.index[current_cell_global_idx] # This is the Name (String)
+        
+        # Fast access using .at for scalar lookups
         current_cell_celltype = self.adata.obs.at[current_cell_idx, 'celltype']
         current_cell_genotype = self.adata.obs.at[current_cell_idx, 'genotype']
         current_cell_batch_label = self.adata.obs.at[current_cell_idx, 'batch_id']
 
-        # 2. Get expression data for the current cell
-        binned_layer_key = self.expr_layer
-        curr_gene = self.adata.var.index
-        current_expr = self.adata.layers[binned_layer_key][current_cell_global_idx]
-        if issparse(current_expr):
-            current_expr = current_expr.toarray().flatten()
-
-        # 3. Sample the next cell and its metadata
+        # 2. Sample Next Cell
         if self.sample_once:
             if current_cell_idx in self.cell2cell_dict:
-                next_cell_id, next_pert_label_str  = self.cell2cell_dict[current_cell_idx]
+                next_cell_id, next_pert_label_str = self.cell2cell_dict[current_cell_idx]
             else:
-                next_cell_id, next_pert_label_str = self._sample_next_cell(current_cell_idx, current_cell_celltype,  current_cell_genotype)
+                next_cell_id, next_pert_label_str = self._sample_next_cell(current_cell_idx, current_cell_celltype, current_cell_genotype)
                 self.cell2cell_dict[current_cell_idx] = (next_cell_id, next_pert_label_str)
         else:
-            next_cell_id, next_pert_label_str = self._sample_next_cell(current_cell_idx, current_cell_celltype,  current_cell_genotype)
-        next_cell_global_idx = self.adata.obs.index.get_loc(next_cell_id)
+            next_cell_id, next_pert_label_str = self._sample_next_cell(current_cell_idx, current_cell_celltype, current_cell_genotype)
         
-        # 4. Get expression data for the next cell
-        next_expr = self.adata.layers[binned_layer_key][next_cell_global_idx]
-        next_gene = self.adata.var.index
-        if issparse(next_expr):
-            next_expr = next_expr.toarray().flatten()
+        # 3. Resolve Next Cell to Global Index
+        # We need the integer location to fetch expression data
+        next_cell_global_idx = self.adata.obs.index.get_loc(next_cell_id)
 
-        # 5. Get labels and PS scores
+        # 4. Fetch Expression Data
+        # Flatten sparse matrices if necessary
+        current_expr = self.adata.layers[self.expr_layer][current_cell_global_idx]
+        if issparse(current_expr): current_expr = current_expr.toarray().flatten()
+
+        next_expr = self.adata.layers[self.expr_layer][next_cell_global_idx]
+        if issparse(next_expr): next_expr = next_expr.toarray().flatten()
+
+        # 5. Prepare Labels
         cell_label = self.cell_type_to_index[current_cell_celltype]
         pert_label = self.genotype_to_index[current_cell_genotype]
-        batch_label = current_cell_batch_label
-        # Next cell labels are the same for cell type, but perturbation can change
-        cell_label_next = cell_label
         pert_label_next = self.genotype_to_index[next_pert_label_str]
-
-        #ps_scores = np.array([self.adata.obs.at[current_cell_idx, ps] for ps in self.ps_columns]).astype(np.float32) if self.ps_columns else np.array([0.0], dtype=np.float32)
+        
+        # 6. Prepare PS Scores
         ps_scores = self.ps_matrix[current_cell_global_idx]
-        #ps_scores_next = self.adata.obs.loc[next_cell_id, self.ps_columns].values.astype(np.float32) if self.ps_columns else np.array([0.0], dtype=np.float32)
         ps_scores_next = self.ps_matrix[next_cell_global_idx]
+
+        # 7. Lochness Logic (Overrides next ps/pert labels)
         if self.next_cell_pred == "lochness":
-            #pert_label = self.genotype_to_index[current_cell_obs['genotype']]
             selection_pool_length = len(self.ps_columns_perturbed_genes) + len(self.additional_ps_names)
             random_pert_ind = random.randint(0, selection_pool_length-1)
-            if random_pert_ind < len(self.ps_columns_perturbed_genes): # falls within the provided ps
-                pert_label_next = self.genotype_to_index[self.ps_columns_perturbed_genes[random_pert_ind]] # this is the randomly assigned perturbations
-                ps_scores_next = np.array([ps_scores[random_pert_ind]], dtype=np.float32)  # note that the target prediction is not the PS of NEXT cell, but the current cell
-            else: # falls within additional ps scores defined in additional_ps_dict
+            
+            if random_pert_ind < len(self.ps_columns_perturbed_genes): 
+                pert_label_next = self.genotype_to_index[self.ps_columns_perturbed_genes[random_pert_ind]] 
+                ps_scores_next = np.array([ps_scores[random_pert_ind]], dtype=np.float32) 
+            else:
                 selected_gene = self.additional_ps_names[random_pert_ind - len(self.ps_columns_perturbed_genes)] 
                 pert_label_next = self.genotype_to_index[selected_gene]
                 ps_scores_next = np.array([self.additional_ps_dict[selected_gene]], dtype=np.float32) 
-        
+
         return {
             "expr": current_expr,
             "expr_next": next_expr,
-            "genes": curr_gene,
-            "next_genes": next_gene,
+            "genes": self.adata.var.index,
+            "next_genes": self.adata.var.index,
             "celltype_labels": cell_label,
             "perturbation_labels": pert_label,
-            "batch_labels": batch_label,
-            "celltype_labels_next": cell_label_next,
+            "batch_labels": current_cell_batch_label,
+            "celltype_labels_next": cell_label, # Cell type invariant
             "perturbation_labels_next": pert_label_next,
             "ps": ps_scores,
             "ps_next": ps_scores_next,
@@ -474,7 +532,8 @@ class PertTFUniDataManager:
     def _create_dataset_from_indices(self, indices, sample_once = False):
         """A helper function to create PertTFDataset from underlying adata."""
         perttf_dataset = PertTFDataset(
-            self.adata, indices=indices, cell_type_to_index=self.cell_type_to_index, genotype_to_index=self.genotype_to_index,
+            self.adata, indices=indices, use_ot=self.config.use_ot, ot_pickle_path=self.config.ot_pickle_path, 
+            cell_type_to_index=self.cell_type_to_index, genotype_to_index=self.genotype_to_index,
             ps_columns=self.ps_columns, ps_columns_perturbed_genes = self.ps_columns_perturbed_genes, 
             next_cell_pred=self.next_cell_pred_type ,  additional_ps_dict = self.additional_ps_dict,  
             expr_layer=self.expr_layer, only_sample_wt_pert=self.only_sample_wt_pert, sample_once=sample_once
