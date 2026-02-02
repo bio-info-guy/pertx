@@ -1,5 +1,4 @@
 import numpy as np
-import pandas as pd
 import jax
 import jax.numpy as jnp
 from ott.geometry import pointcloud
@@ -7,111 +6,159 @@ from ott.problems.linear import linear_problem
 from ott.solvers.linear import sinkhorn
 from functools import partial
 
-# --- JAX Optimal Transport Engine ---
-@partial(jax.jit, static_argnames=['top_k', 'epsilon'])
-def _solve_ot_batch_with_cost(X_source, X_target, top_k=10, epsilon=0.1):
+# --- JAX Solver with Padding Support ---
+# 1. epsilon is REMOVED from static_argnames (Fixes the main recompilation bug)
+# 2. top_k remains static because it determines output shape size
+@partial(jax.jit, static_argnames=['top_k'])
+def _solve_ot_padded_jit(X_source_padded, X_target_padded, 
+                         weights_source, weights_target, 
+                         epsilon, top_k=10):
     """
-    Returns: weights, local_indices, AND costs (squared euclidean distances)
+    Solves OT with padded inputs. 
+    Weights of 0.0 indicate padded (fake) points to be ignored by Sinkhorn.
     """
-    # 1. Solve Sinkhorn
-    geom = pointcloud.PointCloud(X_source, X_target, epsilon=epsilon)
-    out = sinkhorn.Sinkhorn()(linear_problem.LinearProblem(geom))
+    # Define Geometry
+    geom = pointcloud.PointCloud(X_source_padded, X_target_padded, epsilon=epsilon)
+    
+    # Define Problem with weights (a=source weights, b=target weights)
+    # Sinkhorn handles 0-weights by treating them as having no mass.
+    prob = linear_problem.LinearProblem(geom, a=weights_source, b=weights_target)
+    
+    # Solve
+    out = sinkhorn.Sinkhorn()(prob)
     P = out.matrix
     
-    # 2. Get Top-K Probabilities and Indices
+    # Get Top-K Probabilities and Indices
     weights, local_indices = jax.lax.top_k(P, k=top_k)
-    weights = weights / (jnp.sum(weights, axis=1, keepdims=True) + 1e-10)
     
-    # 3. Compute the Actual Distances for these Top-K pairs
-    # X_source shape: (N, Dim) -> (N, 1, Dim)
-    # X_target shape: (M, Dim) -> Gathered (N, K, Dim) using local_indices
-    target_points = X_target[local_indices] 
-    source_points = X_source[:, None, :]
+    # Normalize weights (avoid division by zero for padded rows)
+    sum_weights = jnp.sum(weights, axis=1, keepdims=True) + 1e-10
+    weights = weights / sum_weights
     
-    # Squared Euclidean Distance: sum((x - y)^2)
+    # Compute Distances
+    target_points = X_target_padded[local_indices]
+    source_points = X_source_padded[:, None, :]
     dists = jnp.sum((source_points - target_points) ** 2, axis=-1)
     
     return weights, local_indices, dists
 
-def compute_ot_for_subset(adata_subset, top_k=10, epsilon='auto', max_dist_sq="auto", pca_key='X_pca'):
+def get_next_power_of_2(n, min_size=128):
     """
-    Orchestrates the OT calculation for a specific subset of data.
-    Returns: { cell_name: { pert_label: (target_names_list, weights_list) } }
+    Returns the next power of 2 greater than or equal to n.
+    Clamped at a minimum size to avoid tiny kernels.
     """
+    if n <= min_size:
+        return min_size
+    # This bit-shifting trick finds the next power of 2
+    return 1 << (n - 1).bit_length()
+
+def get_padded_arrays(X, min_size=128):
+    """Pads array X to the next power of 2."""
+    n_rows, n_cols = X.shape
+    
+    # CALCULATE NEW SHAPE
+    n_pad = get_next_power_of_2(n_rows, min_size=min_size)
+    
+    # Pad Data with zeros
+    X_pad = np.zeros((n_pad, n_cols))
+    X_pad[:n_rows] = X
+    
+    # Create Weights
+    # 1.0 for real data, 0.0 for padded
+    weights = np.zeros(n_pad)
+    # Normalize weights so they sum to 1 relative to the REAL data
+    weights[:n_rows] = 1.0 / n_rows
+    
+    return X_pad, weights, n_rows
+
+def compute_ot_for_subset(adata_subset, top_k=10, epsilon='auto', max_dist_sq="auto", pca_key='X_pca', epsilon_scaler=0.01, min_bucket=128):
     ot_results = {}
     
-    # Iterate by Cell Type to enforce biological constraint
+    # Iterate by Cell Type
     unique_celltypes = adata_subset.obs['celltype'].unique()
     
     for ctype in unique_celltypes:
-        # Mask for this cell type
         mask_ctype = adata_subset.obs['celltype'] == ctype
         
-        # Identify Sources (WT)
+        # Identify Source (WT)
         mask_wt = mask_ctype & (adata_subset.obs['genotype'] == 'WT')
         if not np.any(mask_wt): continue 
 
         # Prepare Source Data
-        X_wt = adata_subset.obsm[pca_key][mask_wt]
+        X_wt_raw = adata_subset.obsm[pca_key][mask_wt]
         wt_names = adata_subset.obs.index[mask_wt].tolist()
         
-        # Convert to JAX array once per cell type (Source is constant)
-        X_wt_jax = jnp.array(X_wt)
+        # Pad Source ONCE per cell type
+        X_wt_pad, w_wt, n_wt = get_padded_arrays(X_wt_raw, min_size=min_bucket)
+        #print('-------------------------')
+        #print(f'wt {ctype} bucket size: {X_wt_pad.shape}')
+        X_wt_jax = jnp.array(X_wt_pad)
+        w_wt_jax = jnp.array(w_wt)
 
-        # Iterate over Perturbations (Targets)
+        # Iterate over Perturbations
         available_perts = adata_subset.obs.loc[mask_ctype, 'genotype'].unique()
         available_perts = [p for p in available_perts if p != 'WT']
         
         for pert in available_perts:
             mask_pert = mask_ctype & (adata_subset.obs['genotype'] == pert)
-            if mask_pert.sum() < top_k: continue # Skip if too few targets
+            if mask_pert.sum() < top_k: continue
 
             # Prepare Target Data
-            X_pert = adata_subset.obsm[pca_key][mask_pert]
+            X_pert_raw = adata_subset.obsm[pca_key][mask_pert]
             target_names = adata_subset.obs.index[mask_pert].values 
             
-            # --- DYNAMIC THRESHOLD CALCULATION ---
-            # If "auto", we calculate the median distance for THIS SPECIFIC pair
+            # Pad Target
+            X_pert_pad, w_pert, n_pert = get_padded_arrays(X_pert_raw, min_size=min_bucket)
+            #print(f'{pert} {ctype} bucket size: {X_pert_pad.shape}')
+            X_pert_jax = jnp.array(X_pert_pad)
+            w_pert_jax = jnp.array(w_pert)
+            
+            # --- DYNAMIC THRESHOLD ---
             current_threshold = max_dist_sq if max_dist_sq is not None else np.inf
             if max_dist_sq == "auto":
-                # We use the raw numpy arrays X_wt and X_pert
-                current_threshold, suggested_eps = estimate_context_threshold(X_wt, X_pert)
-            # -------------------------------------
-            if epsilon == 'auto':
-                epsilon = suggested_eps
-            # Convert Target to JAX
-            X_pert_jax = jnp.array(X_pert)
+                # Use raw (unpadded) numpy arrays for estimation
+                current_threshold, suggested_eps = estimate_context_threshold(X_wt_raw, X_pert_raw, epsilon_scaler=epsilon_scaler)
             
-            # --- EXECUTE JAX ---
+            this_epsilon = suggested_eps if epsilon == 'auto' else epsilon
+            
+            # --- EXECUTE JAX (Padded) ---
             try:
-                weights, indices, dists = _solve_ot_batch_with_cost(
-                    X_wt_jax, X_pert_jax, top_k=top_k, epsilon=epsilon
+                # Pass epsilon as a regular argument, not static
+                weights, indices, dists = _solve_ot_padded_jit(
+                    X_wt_jax, X_pert_jax, w_wt_jax, w_pert_jax, 
+                    epsilon=this_epsilon, top_k=top_k
                 )
                 
-                # Move to CPU
-                weights_np = np.array(weights)
-                indices_np = np.array(indices)
-                dists_np = np.array(dists)
+                # Move to CPU and Slice off padding
+                # We only need the first n_wt rows (real source cells)
+                weights_np = np.array(weights[:n_wt])
+                indices_np = np.array(indices[:n_wt])
+                dists_np = np.array(dists[:n_wt])
                 
                 # --- FORMAT RESULTS ---
                 for i, wt_name in enumerate(wt_names):
-                    # Filter based on distance of the best match
-                    # dists_np[i, 0] is the squared distance to the #1 top-k match
                     if dists_np[i, 0] > current_threshold:
-                        continue # Skip this cell, even its best match is too far
+                        continue 
 
                     if wt_name not in ot_results: ot_results[wt_name] = {}
                     
-                    # Map indices back to names
-                    chosen_target_names = target_names[indices_np[i]]
-                    ot_results[wt_name][pert] = (chosen_target_names, weights_np[i])
+                    # Safety check: ensure indices don't point to padded target zones
+                    # (Sinkhorn *shouldn't* pick them because weight is 0, but top_k might grab them if K > valid targets)
+                    valid_match_mask = indices_np[i] < n_pert
+                    
+                    # If we somehow picked a padded cell, we filter it out here
+                    chosen_indices = indices_np[i][valid_match_mask]
+                    chosen_weights = weights_np[i][valid_match_mask]
+                    
+                    chosen_target_names = target_names[chosen_indices]
+                    ot_results[wt_name][pert] = (chosen_target_names, chosen_weights)
                     
             except Exception as e:
                 print(f"OT Failed for {ctype} -> {pert}: {e}")
                 
     return ot_results
 
-def estimate_context_threshold(X_wt, X_pert, sample_size=1000):
+def estimate_context_threshold(X_wt, X_pert, epsilon_scaler = 0.01, sample_size=1000):
     """
     Estimates a distance threshold specifically for this WT -> Pert pair.
     We compute the median distance between random pairs of (WT, Pert) cells.
@@ -138,6 +185,6 @@ def estimate_context_threshold(X_wt, X_pert, sample_size=1000):
     
     # Heuristic: Set epsilon to ~5-10% of the median squared distance
     # This ensures the exponent -dist/eps is roughly -10 to -20, preventing numerical collapse
-    suggested_epsilon = median_dist * 0.1
+    suggested_epsilon = median_dist * epsilon_scaler
     
     return median_dist, suggested_epsilon

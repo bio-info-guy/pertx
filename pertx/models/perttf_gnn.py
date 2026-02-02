@@ -76,7 +76,7 @@ class PertTFGraphModel(BaseModel):
                     self.pert_encoder = PertLabelEncoder(n_pert, pert_dim, padding_idx=self.pert_pad_id)
             else: # prior integrated embedding
                 self.pert_base_emb = self.base_emb if self.gene_pert_shared else copy.deepcopy(self.base_emb) # seperate prior embeddings if not shared
-                self.pert_encoder = GeneHead(self.pert_base_emb, d_model)
+                self.pert_encoder = GeneHead(self.pert_base_emb, pert_dim) if pert_dim != self.pert_base_emb.embedding.weight.shape[-1] else self.pert_base_emb
         else: # graph embeddings
             if self.base_emb is None: # vanilla embeddings
                 if self.gene_pert_shared: # shared encoder for perturbation
@@ -122,6 +122,13 @@ class PertTFGraphModel(BaseModel):
             self.ps_decoder2 = PSDecoder(d_model, 1, nlayers = ps_decoder2_nlayer, geneinput = True)
         else:
             self.ps_decoder2 = None
+
+
+    def load_hybrid_weight(self, load, vocab) -> None:
+        if self.gene_emb_style == 'hybrid':
+            self.base_emb.load_weights(load, vocab)
+            if not self.gene_pert_shared:
+                self.pert_base_emb.load_weights(load, vocab)
 
     # rewrite encode function
     def _encode(

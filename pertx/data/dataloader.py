@@ -47,6 +47,7 @@ class PertTFDataset(Dataset):
                  ot_top_k: int = 10,
                  ot_epsilon: Union[float, str] = "auto",
                  ot_max_dist: Union[float, str] = "auto",
+                 ot_epsilon_scaler: float = 0.01,
                  # Standard Parameters
                  cell_type_to_index: dict = None, 
                  genotype_to_index: dict = None, 
@@ -70,6 +71,7 @@ class PertTFDataset(Dataset):
         self.ot_top_k = ot_top_k
         self.ot_epsilon = ot_epsilon
         self.ot_max_dist = ot_max_dist
+        self.ot_epsilon_scaler = ot_epsilon_scaler
         self.ot_cache = {} # Holds the map for the CURRENT indices
         
         self.expr_layer = expr_layer
@@ -170,19 +172,15 @@ class PertTFDataset(Dataset):
     def _recalculate_ot(self):
         # 1. Create View
         adata_subset = self.adata[self.indices]
-        
-        # --- NEW: Auto-Calibration Logic ---
-        current_threshold = self.ot_max_dist
-        
-        # -----------------------------------
 
         # 2. Compute Maps (Pass the calculated threshold)
         new_maps = compute_ot_for_subset(
             adata_subset, 
             top_k=self.ot_top_k, 
             epsilon=self.ot_epsilon,
-            max_dist_sq=current_threshold, # <--- Use the variable, not self.ot_max_dist
-            pca_key='X_pca'
+            max_dist_sq=self.ot_max_dist, 
+            pca_key='X_pca',
+            epsilon_scaler=self.ot_epsilon_scaler
         )
         
         # 3. Update Cache & Pickle (Same as before)
@@ -532,11 +530,25 @@ class PertTFUniDataManager:
     def _create_dataset_from_indices(self, indices, sample_once = False):
         """A helper function to create PertTFDataset from underlying adata."""
         perttf_dataset = PertTFDataset(
-            self.adata, indices=indices, use_ot=self.config.use_ot, ot_pickle_path=self.config.ot_pickle_path, 
-            cell_type_to_index=self.cell_type_to_index, genotype_to_index=self.genotype_to_index,
-            ps_columns=self.ps_columns, ps_columns_perturbed_genes = self.ps_columns_perturbed_genes, 
-            next_cell_pred=self.next_cell_pred_type ,  additional_ps_dict = self.additional_ps_dict,  
-            expr_layer=self.expr_layer, only_sample_wt_pert=self.only_sample_wt_pert, sample_once=sample_once
+            self.adata, 
+            indices=indices, 
+            # ot parameters
+            use_ot=self.config.use_ot, 
+            ot_pickle_path=self.config.ot_pickle_path, 
+            ot_top_k=self.config.ot_top_k,
+            ot_epsilon=self.config.ot_epsilon,
+            ot_epsilon_scaler=self.config.ot_epsilon_scaler,
+            ot_max_dist=self.config.ot_max_dist,
+            # other parameters
+            cell_type_to_index=self.cell_type_to_index, 
+            genotype_to_index=self.genotype_to_index,
+            ps_columns=self.ps_columns, 
+            ps_columns_perturbed_genes = self.ps_columns_perturbed_genes, 
+            next_cell_pred=self.next_cell_pred_type ,  
+            additional_ps_dict = self.additional_ps_dict,  
+            expr_layer=self.expr_layer, 
+            only_sample_wt_pert=self.only_sample_wt_pert, 
+            sample_once=sample_once
         )
         return perttf_dataset
 
