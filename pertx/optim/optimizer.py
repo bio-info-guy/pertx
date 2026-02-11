@@ -126,7 +126,6 @@ def create_optimizer_dict(model, device, config, dataloader, num_batch_types = -
             d_model=config.layer_size, # embsize
             n_cls=num_batch_types,
         ).to(device)
-        print(discriminator)
     else:
         discriminator = None
 
