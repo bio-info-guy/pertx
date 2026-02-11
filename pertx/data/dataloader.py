@@ -18,6 +18,15 @@ from ..tokenizer.custom_tokenizer import tokenize_and_pad_batch, random_mask_val
 from ..sampler.ot import compute_ot_for_subset
 
 
+def _get_sf(X):
+    if issparse(X):
+        X = X.toarray()
+    X[X == 0] = np.inf
+    X_mins = X.min(1)
+    X[X == np.inf ] = 0
+    sf = np.exp(X_mins).reshape(-1,1)-1
+    return sf
+
 def add_batch_info(adata):
     """helper function to add batch effect columns into adata"""
     if "batch" not in adata.obs.columns: 
@@ -50,7 +59,7 @@ class PertTFDataset(Dataset):
                  ot_epsilon_scaler: float = 0.01,
                  # Standard Parameters
                  cell_type_to_index: dict = None, 
-                 genotype_to_index: dict = None, 
+                 genotype_to_index: dict = None,
                  expr_layer: str = 'X_binned',
                  ps_columns: list = None, 
                  ps_columns_perturbed_genes: list = None, 
@@ -64,7 +73,6 @@ class PertTFDataset(Dataset):
         self.cell2cell_dict = {}
         self._check_anndata_content()
         self.indices = indices if indices is not None else np.arange(len(self.adata.obs.index))
-        
         # OT Configuration
         self.use_ot = use_ot
         self.ot_pickle_path = ot_pickle_path
@@ -86,7 +94,7 @@ class PertTFDataset(Dataset):
         
         
         # Handle Lochness specific setup
-
+        self.sf = _get_sf(self.adata.layers[self.expr_layer])
         # Initialize pools and OT
         self.next_cell_dict = self._create_next_cell_pool()
         self.only_sample_wt_pert = only_sample_wt_pert
@@ -179,7 +187,7 @@ class PertTFDataset(Dataset):
             top_k=self.ot_top_k, 
             epsilon=self.ot_epsilon,
             max_dist_sq=self.ot_max_dist, 
-            pca_key='X_pca',
+            red_key='X_pca',
             epsilon_scaler=self.ot_epsilon_scaler
         )
         
@@ -266,6 +274,7 @@ class PertTFDataset(Dataset):
             possible_next_cells = valid_genotypes.get(next_pert_value, [current_cell_idx])
             next_cell_id = random.choice(possible_next_cells)
             return next_cell_id, next_pert_value
+        
     def __getitem__(self, idx: int):
         # 1. Get Global Index and Metadata
         current_cell_global_idx = self.indices[idx]
@@ -275,7 +284,7 @@ class PertTFDataset(Dataset):
         current_cell_celltype = self.adata.obs.at[current_cell_idx, 'celltype']
         current_cell_genotype = self.adata.obs.at[current_cell_idx, 'genotype']
         current_cell_batch_label = self.adata.obs.at[current_cell_idx, 'batch_id']
-
+        
         # 2. Sample Next Cell
         if self.sample_once:
             if current_cell_idx in self.cell2cell_dict:
@@ -290,6 +299,7 @@ class PertTFDataset(Dataset):
         # We need the integer location to fetch expression data
         next_cell_global_idx = self.adata.obs.index.get_loc(next_cell_id)
 
+
         # 4. Fetch Expression Data
         # Flatten sparse matrices if necessary
         current_expr = self.adata.layers[self.expr_layer][current_cell_global_idx]
@@ -298,6 +308,8 @@ class PertTFDataset(Dataset):
         next_expr = self.adata.layers[self.expr_layer][next_cell_global_idx]
         if issparse(next_expr): next_expr = next_expr.toarray().flatten()
 
+        current_sf = self.sf[current_cell_global_idx]
+        next_sf = self.sf[next_cell_global_idx]
         # 5. Prepare Labels
         cell_label = self.cell_type_to_index[current_cell_celltype]
         pert_label = self.genotype_to_index[current_cell_genotype]
@@ -319,7 +331,6 @@ class PertTFDataset(Dataset):
                 selected_gene = self.additional_ps_names[random_pert_ind - len(self.ps_columns_perturbed_genes)] 
                 pert_label_next = self.genotype_to_index[selected_gene]
                 ps_scores_next = np.array([self.additional_ps_dict[selected_gene]], dtype=np.float32) 
-
         return {
             "expr": current_expr,
             "expr_next": next_expr,
@@ -332,6 +343,8 @@ class PertTFDataset(Dataset):
             "perturbation_labels_next": pert_label_next,
             "ps": ps_scores,
             "ps_next": ps_scores_next,
+            "sf": current_sf,
+            "sf_next": next_sf,
             "index": current_cell_global_idx,
             "next_index": next_cell_global_idx,
             'name': current_cell_idx,
@@ -405,7 +418,12 @@ class PertBatchCollator:
         )
 
         # 4. Collate all other labels into tensors
-        full_gene_id = torch.from_numpy(self.gene_ids).long()
+        cls_vec = np.array([self.cls_value for i in range(len(batch))]).reshape(-1,1)
+        full_gene_id = np.insert(self.gene_ids, 0, self.vocab[self.cls_token]) if self.append_cls else self.gene_ids
+        full_gene_id = torch.from_numpy(full_gene_id).long()
+        expr_mat = expr_mat if not self.append_cls else np.hstack([cls_vec, expr_mat])
+        expr_mat_next = expr_mat_next if not self.append_cls else np.hstack([cls_vec, expr_mat_next])
+
         collated_batch = {
             "gene_ids": tokenized["genes"],
             "next_gene_ids": tokenized_next["genes"],

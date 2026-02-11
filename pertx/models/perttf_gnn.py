@@ -106,7 +106,8 @@ class PertTFGraphModel(BaseModel):
                 arch_style=self.mvc_decoder_style,
                 explicit_zero_prob=self.explicit_zero_prob,
                 use_batch_labels=self.use_batch_labels,
-                expr_activation=self.expr_activation
+                expr_activation=self.expr_activation,
+                dispersion=self.nbll
             )
         else:
             self.mvc_decoder2 = None
@@ -194,6 +195,8 @@ class PertTFGraphModel(BaseModel):
         batch_labels: Optional[Tensor] = None,
         pert_labels: Optional[Tensor] = None, 
         pert_labels_next: Optional[Tensor] = None, 
+        sf: Optional[Tensor] = None,
+        sf_next: Optional[Tensor] = None,
         CLS: bool = False,
         CCE: bool = False,
         MVC: bool = False,
@@ -312,6 +315,7 @@ class PertTFGraphModel(BaseModel):
                 else torch.cat([cell_emb, batch_emb], dim=1),
                 # else cell_emb + batch_emb,
                 cur_gene_token_embs,
+                target_size_factor = sf if self.nbll else None
             )
             
             pert_mvc_decoder = self.mvc_decoder if not self.sep_pert_mvc else self.mvc_decoder2
@@ -322,6 +326,7 @@ class PertTFGraphModel(BaseModel):
                 else torch.cat([cell_emb_next, batch_emb], dim=1),
                 # else cell_emb + batch_emb,
                 cur_gene_token_embs, # is it working well??
+                target_size_factor = sf_next if self.nbll else None
             )
 
             if self.mvc_residual:
@@ -342,6 +347,10 @@ class PertTFGraphModel(BaseModel):
             if self.explicit_zero_prob:
                 output["mvc_zero_probs"] = mvc_output["zero_probs"]
                 output["mvc_zero_probs_next"] = mvc_output_next["zero_probs"]
+
+            if self.nbll:
+                output["mvc_dispersion"] = mvc_output['dispersion']
+                output["mvc_dispersion_next"] = mvc_output_next['dispersion']
         if ECS:
             # Here using customized cosine similarity instead of F.cosine_similarity
             # to avoid the pytorch issue of similarity larger than 1.0, pytorch # 78064
@@ -386,12 +395,14 @@ class PertTFGraphModel(BaseModel):
         batch_labels: Optional[Tensor] = None,
         pert_labels: Optional[Tensor] = None, # the first perturbation
         pert_labels_next: Optional[Tensor] = None, # the second perturbation
+        sf: Optional[Tensor] = None,
         output_to_cpu: bool = True,
         time_step: Optional[int] = None,
         return_np: bool = False,
         predict_expr = False,
         mvc_src: Tensor = None, # optional MVC tensor of gene ids for MVC decoder
-        mvc_val: Tensor = None
+        mvc_val: Tensor = None,
+        nb_sample: bool = False
     ) -> Tuple[Tensor, Tensor, Tensor]:
         """
         revised scgpt.TransformerModel.encode_batch but with additional perturbation
@@ -448,7 +459,8 @@ class PertTFGraphModel(BaseModel):
             mlm_outputs, mlm_zero_outputs = array_func(mlm_expr_shape, dtype=float32_), array_func(mlm_expr_shape, dtype=float32_)
             mvc_outputs, mvc_zero_outputs = array_func(mvc_expr_shape, dtype=float32_), array_func(mvc_expr_shape, dtype=float32_)
             mvc_next_outputs, mvc_next_zero_outputs = array_func(mvc_expr_shape, dtype=float32_), array_func(mvc_expr_shape, dtype=float32_)
-
+            if self.nbll:
+                mvc_theta_outputs, mvc_next_theta_outputs = array_func(mvc_expr_shape, dtype=float32_), array_func(mvc_expr_shape, dtype=float32_)
         for i in trange(0, N, batch_size):
             src_d = src[i : i + batch_size].to(device)
             values_d = values[i : i + batch_size].to(device)
@@ -459,6 +471,7 @@ class PertTFGraphModel(BaseModel):
             pert_labels_next_d = pert_labels_next[i : i + batch_size].to(device) if pert_labels_next is not None else None
             mvc_src_d = mvc_src[i:i+batch_size].to(device) if mvc_src is not None else None
             mvc_val_d = mvc_val[i:i+batch_size].to(device) if mvc_src is not None else None
+            sf_d = sf[i:i+batch_size].to(device) if sf is not None else None
             raw_output = self._encode(
                 src_d,
                 values_d,
@@ -555,20 +568,22 @@ class PertTFGraphModel(BaseModel):
                     cur_gene_token_embs = cur_gene_token_embs + val_emb
                 if self.decoder_layer:
                     cur_gene_token_embs = self.transformer_decoder(cur_gene_token_embs, raw_output, memory_key_padding_mask=src_key_padding_mask_d)
-                mvc_output = self.mvc_decoder(
+                mvc_output = self.mvc_decoder.generate(
                                 cell_emb if not self.use_batch_labels
-                                else torch.cat([cell_emb, batch_emb], 
-                                dim=1
-                                ), # else cell_emb + batch_emb,
-                            cur_gene_token_embs,)
+                                else torch.cat([cell_emb, batch_emb], dim=1),
+                                cur_gene_token_embs,
+                                target_size_factor=sf_d,
+                                sample = nb_sample
+                            )
                 if pert_labels_next_d is not None:
                     pert_mvc_decoder = self.mvc_decoder if not self.sep_pert_mvc else self.mvc_decoder2
-                    mvc_output_next = pert_mvc_decoder(
-                                cell_emb_next if not self.use_batch_labels
-                                else torch.cat([cell_emb_next, batch_emb], 
-                                dim=1
-                                ), # else cell_emb + batch_emb,
-                            cur_gene_token_embs,)
+                    mvc_output_next = pert_mvc_decoder.generate(
+                                    cell_emb_next if not self.use_batch_labels
+                                    else torch.cat([cell_emb_next, batch_emb], dim=1),
+                                    cur_gene_token_embs,
+                                    target_size_factor=sf_d,
+                                    sample = nb_sample
+                                )
                 else:
                     mvc_output_next = mvc_output
                 if self.mvc_residual:
@@ -576,26 +591,29 @@ class PertTFGraphModel(BaseModel):
                     mvc_output["pred"] = mvc_output["pred"] + mvc_base_val
                     mvc_output_next["pred"] = mvc_output_next["pred"] + mvc_base_val
                 mlm_pred, mlm_zero_probs = mlm_output['pred'], mlm_output['zero_probs'] if self.explicit_zero_prob else 1
-                mvc_pred, mvc_zero_probs = mvc_output['pred'], mvc_output['zero_probs'] if self.explicit_zero_prob else 1
-                mvc_pred_next, mvc_zero_probs_next = mvc_output_next['pred'], mvc_output_next['zero_probs'] if self.explicit_zero_prob else 1
+                mvc_pred, mvc_theta, mvc_zero_probs = mvc_output['pred'], mvc_output['theta'], mvc_output['zero_probs'] if self.explicit_zero_prob else 1
+                mvc_pred_next, mvc_theta_next, mvc_zero_probs_next = mvc_output_next['pred'], mvc_output_next['theta'], mvc_output_next['zero_probs'] if self.explicit_zero_prob else 1
                 if output_to_cpu:
                     mlm_pred, mlm_zero_probs = mlm_pred.cpu(), mlm_zero_probs.cpu() if self.explicit_zero_prob else 1
-                    mvc_pred, mvc_zero_probs =  mvc_pred.cpu(), mvc_zero_probs.cpu() if self.explicit_zero_prob else 1
-                    mvc_pred_next, mvc_zero_probs_next = mvc_pred_next.cpu(), mvc_zero_probs_next.cpu() if self.explicit_zero_prob else 1
+                    mvc_pred, mvc_theta, mvc_zero_probs =  mvc_pred.cpu(), mvc_theta.cpu(), mvc_zero_probs.cpu() if self.explicit_zero_prob else 1
+                    mvc_pred_next, mvc_theta_next, mvc_zero_probs_next = mvc_pred_next.cpu(), mvc_theta_next.cpu(), mvc_zero_probs_next.cpu() if self.explicit_zero_prob else 1
                 if return_np:
                     mlm_pred, mlm_zero_probs = mlm_pred.numpy(), mlm_zero_probs.numpy() if self.explicit_zero_prob else 1
-                    mvc_pred, mvc_zero_probs =  mvc_pred.numpy(), mvc_zero_probs.numpy() if self.explicit_zero_prob else 1
-                    mvc_pred_next, mvc_zero_probs_next = mvc_pred_next.numpy(), mvc_zero_probs_next.numpy() if self.explicit_zero_prob else 1
+                    mvc_pred, mvc_theta, mvc_zero_probs =  mvc_pred.numpy(),mvc_theta.numpy(), mvc_zero_probs.numpy() if self.explicit_zero_prob else 1
+                    mvc_pred_next, mvc_theta_next, mvc_zero_probs_next = mvc_pred_next.numpy(), mvc_theta_next.numpy(), mvc_zero_probs_next.numpy() if self.explicit_zero_prob else 1
 
                 mlm_outputs[i : i + batch_size], mlm_zero_outputs[i : i + batch_size] = mlm_pred, mlm_zero_probs
-                mvc_outputs[i : i + batch_size], mvc_zero_outputs[i : i + batch_size] = mvc_pred, mvc_zero_probs
-                mvc_next_outputs[i : i + batch_size], mvc_next_zero_outputs[i : i + batch_size] = mvc_pred_next, mvc_zero_probs_next
-
+                mvc_outputs[i : i + batch_size], mvc_theta_outputs[i:i+batch_size], mvc_zero_outputs[i : i + batch_size] = mvc_pred, mvc_theta, mvc_zero_probs
+                mvc_next_outputs[i : i + batch_size], mvc_next_theta_outputs[i:i+batch_size], mvc_next_zero_outputs[i : i + batch_size] = mvc_pred_next, mvc_theta_next, mvc_zero_probs_next
+                
 
         if predict_expr:
             expr_dict['mlm_expr'] = (mlm_outputs[:,1:], mlm_zero_outputs[:,1:])
             expr_dict['mvc_expr'] = (mvc_outputs[:,1:], mvc_zero_outputs[:,1:])
             expr_dict['mvc_next_expr'] = (mvc_next_outputs[:,1:], mvc_next_zero_outputs[:,1:])
+            if self.nbll:
+                expr_dict['mvc_theta'] = [mvc_theta_outputs[:, 1:]]
+                expr_dict['mvc_next_theta'] = [mvc_next_theta_outputs[:, 1:]]
 
         return outputs, outputs_next, pert_outputs, cls_outputs, ps_outputs, ps_outputs_next, expr_dict
 

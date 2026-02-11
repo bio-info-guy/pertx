@@ -66,6 +66,7 @@ class BaseModel(nn.Module):
         gene_emb_dim: int = 512,
         cross_attn_decoder: bool = False,
         decoder_layer: bool = False,
+        nbll: bool = False,
         **kwargs
     ):
         super().__init__()
@@ -91,6 +92,7 @@ class BaseModel(nn.Module):
         self.dropout = dropout
         self.gene_emb_dim = gene_emb_dim
         self.decoder_layer = decoder_layer
+        self.nbll = nbll
         if self.input_emb_style not in ["category", "continuous", "scaling",'autobin']:
             raise ValueError(
                 f"input_emb_style should be one of category, continuous, scaling or autobin "
@@ -99,6 +101,7 @@ class BaseModel(nn.Module):
         if cell_emb_style not in ["cls", "avg-pool", "w-pool"]:
             raise ValueError(f"Unknown cell_emb_style: {cell_emb_style}")
         
+        # TRNASFORMER BACKBONE
         self.use_fast_transformer = use_fast_transformer
         if self.use_fast_transformer == 'flash':
             try:
@@ -148,7 +151,7 @@ class BaseModel(nn.Module):
         
 
         # TODO: add dropout in the GeneEncoder
-        # Select Gene Encoder
+        # GENE ENCODER
         if self.gene_emb_style == 'vanilla':
             self.base_emb = None
             self.encoder = GeneEncoder(ntoken, d_model, padding_idx=self.pad_id)
@@ -163,7 +166,7 @@ class BaseModel(nn.Module):
             # TODO implement a embedding module that can integrate multiple pretrain embeddings
             pass
 
-        # Value Encoder, NOTE: the scaling style is also handled in _encode method
+        # VALUE ENCODER, NOTE: the scaling style is also handled in _encode method
         if self.input_emb_style == "continuous":
             self.value_encoder = ContinuousValueEncoder(d_model, dropout)
         elif self.input_emb_style == "category":
@@ -182,10 +185,11 @@ class BaseModel(nn.Module):
                                                              pad_token_id = pad_value)
         else:
             self.value_encoder = nn.Identity()  # nn.Softmax(dim=1)
+            self.input_emb_style = 'scaling'
             # TODO: consider row-wise normalization or softmax
             # TODO: Correct handle the mask_value when using scaling
 
-        # Batch Encoder
+        # BATCH ENCODER
         if use_batch_labels:
             self.batch_encoder = BatchLabelEncoder(num_batch_labels, d_model)
 
@@ -199,19 +203,23 @@ class BaseModel(nn.Module):
             print("Using simple batchnorm instead of domain specific batchnorm")
             self.bn = nn.BatchNorm1d(d_model, eps=6.1e-5)
 
+        # EXPRESSION DECODER
         self.decoder = ExprDecoder(
             d_model,
             explicit_zero_prob=explicit_zero_prob,
             use_batch_labels=use_batch_labels,
         )
         self.cls_decoder = ClsDecoder(d_model, n_cls, nlayers=nlayers_cls)
+
+        # MVC EXPRESSION DECODER
         if do_mvc:
             self.mvc_decoder = MVCDecoder(
                 d_model,
                 arch_style=self.mvc_decoder_style,
                 explicit_zero_prob=self.explicit_zero_prob,
                 use_batch_labels=self.use_batch_labels,
-                expr_activation=self.expr_activation
+                expr_activation=self.expr_activation,
+                dispersion=self.nbll
             )
 
         if do_dab:
@@ -258,9 +266,7 @@ class BaseModel(nn.Module):
 
         if getattr(self, "dsbn", None) is not None:
             batch_label = int(batch_labels[0].item())
-            total_embs = self.dsbn(total_embs.permute(0, 2, 1), batch_label).permute(
-                0, 2, 1
-            )  # the batch norm always works on dim 1
+            total_embs = self.dsbn(total_embs.permute(0, 2, 1), batch_label).permute(0, 2, 1)
         elif getattr(self, "bn", None) is not None:
             total_embs = self.bn(total_embs.permute(0, 2, 1)).permute(0, 2, 1)
 
@@ -392,11 +398,9 @@ class BaseModel(nn.Module):
         batch_labels: Optional[Tensor] = None,
         mvc_src: Tensor = None ,
         CLS: bool = False,
-        CCE: bool = False,
         MVC: bool = False,
         ECS: bool = False,
-        do_sample: bool = False,
-        
+        do_sample: bool = False, 
     ) -> Mapping[str, Tensor]:
         """
         Args:
@@ -452,36 +456,6 @@ class BaseModel(nn.Module):
 
         if CLS:
             output["cls_output"] = self.cls_decoder(cell_emb)  # (batch, n_cls)
-        if CCE:
-            cell1 = cell_emb
-            transformer_output2 = self._encode(
-                src, values, src_key_padding_mask, batch_labels
-            )
-            cell2 = self._get_cell_emb_from_layer(transformer_output2)
-
-            # Gather embeddings from all devices if distributed training
-            if dist.is_initialized() and self.training:
-                cls1_list = [
-                    torch.zeros_like(cell1) for _ in range(dist.get_world_size())
-                ]
-                cls2_list = [
-                    torch.zeros_like(cell2) for _ in range(dist.get_world_size())
-                ]
-                dist.all_gather(tensor_list=cls1_list, tensor=cell1.contiguous())
-                dist.all_gather(tensor_list=cls2_list, tensor=cell2.contiguous())
-
-                # NOTE: all_gather results have no gradients, so replace the item
-                # of the current rank with the original tensor to keep gradients.
-                # See https://github.com/princeton-nlp/SimCSE/blob/main/simcse/models.py#L186
-                cls1_list[dist.get_rank()] = cell1
-                cls2_list[dist.get_rank()] = cell2
-
-                cell1 = torch.cat(cls1_list, dim=0)
-                cell2 = torch.cat(cls2_list, dim=0)
-            # TODO: should detach the second run cls2? Can have a try
-            cos_sim = self.sim(cell1.unsqueeze(1), cell2.unsqueeze(0))  # (batch, batch)
-            labels = torch.arange(cos_sim.size(0)).long().to(cell1.device)
-            output["loss_cce"] = self.creterion_cce(cos_sim, labels)
         if MVC:
             mvc_output = self.mvc_decoder(
                 cell_emb

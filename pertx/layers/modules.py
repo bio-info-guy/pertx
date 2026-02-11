@@ -658,19 +658,16 @@ class ExpressionActivate(nn.Module):
 
 
 class MVCDecoder(nn.Module):
-    """
-    Decoder for the masked value prediction for cell embeddings.
-    """
-
     def __init__(
         self,
         d_model: int,
         arch_style: str = "inner product",
         query_activation: nn.Module = nn.Sigmoid,
         hidden_activation: nn.Module = nn.PReLU,
-        explicit_zero_prob: bool = False,
+        explicit_zero_prob: bool = True, # Default True for ZINB
         use_batch_labels: bool = False,
-        expr_activation: str = 'linear'
+        expr_activation: str = 'linear',
+        dispersion: bool = False
     ) -> None:
         """
         Args:
@@ -684,7 +681,15 @@ class MVCDecoder(nn.Module):
         """
         super().__init__()
         self.expr_activation = expr_activation
+        self.dispersion  = dispersion
         d_in = d_model * 2 if use_batch_labels else d_model
+        
+        # --- Dispersion Head (New) ---
+        # Predicts gene-specific dispersion from gene embeddings
+        if self.dispersion:
+            self.gene2dispersion = nn.Linear(d_model, 1) 
+            self.expr_activation = 'softplus'
+        # --- Architecture Setup ---
         if arch_style in ["inner product", "inner product, detach"]:
             self.gene2query = nn.Linear(d_model, d_model)
             self.query_activation = query_activation()
@@ -712,43 +717,61 @@ class MVCDecoder(nn.Module):
         self.explicit_zero_prob = explicit_zero_prob
         self.expr_act = ExpressionActivate(activation = self.expr_activation)
     def forward(
-        self, cell_emb: Tensor, gene_embs: Tensor
-    ) -> Union[Tensor, Dict[str, Tensor]]:
+        self, 
+        cell_emb: Tensor, 
+        gene_embs: Tensor, 
+        target_size_factor: Tensor = None
+    ) -> Dict[str, Tensor]:
         """
         Args:
-            cell_emb: Tensor, shape (batch, embsize=d_model)
-            gene_embs: Tensor, shape (batch, seq_len, embsize=d_model)
+            cell_emb: (batch, d_model)
+            gene_embs: (batch, seq_len, d_model)
+            target_size_factor: (batch, 1) - The total counts of the target cell
         """
         gene_embs = gene_embs.detach() if self.do_detach else gene_embs
+        target_size_factor = 1 if target_size_factor is None else target_size_factor
+        # --- 1. Calculate Dispersion (Theta) ---
+        # Theta is purely gene-dependent (from gene_embs)
+        # Shape: (batch, seq_len, 1) -> (batch, seq_len)
+        if self.dispersion:
+            theta = F.softplus(self.gene2dispersion(gene_embs)).squeeze(2)
+            theta = 1/(theta + 1e-6)
+        # --- 2. Calculate Normalized Concentration (Rho) ---
+        pred_concentration = None
+        zero_probs = None # Pi
+
         if self.arch_style in ["inner product", "inner product, detach"]:
             query_vecs = self.query_activation(self.gene2query(gene_embs))
-            cell_emb = cell_emb.unsqueeze(2)  # (batch, embsize, 1)
-            # the pred gene expr values, # (batch, seq_len)
-            pred_value = torch.bmm(self.W(query_vecs), cell_emb).squeeze(2)
-            pred_value = self.expr_act(pred_value)
-            if not self.explicit_zero_prob:
-                return dict(pred=pred_value)
-            # zero logits need to based on the cell_emb, because of input exprs
-            zero_logits = torch.bmm(self.W_zero_logit(query_vecs), cell_emb).squeeze(2)
-            zero_probs = torch.sigmoid(zero_logits)
-            return dict(pred=pred_value, zero_probs=zero_probs)
+            cell_emb_expanded = cell_emb.unsqueeze(2)  # (batch, d_model, 1)
+            
+            # Predict Concentration (raw unscaled mean)
+            # (batch, seq_len, d_model) x (batch, d_model, 1) -> (batch, seq_len)
+            raw_pred = torch.bmm(self.W(query_vecs), cell_emb_expanded).squeeze(2)
+            pred_concentration = self.expr_act(raw_pred) # Enforce positivity
+
+            # Predict Dropout (Pi)
+            if self.explicit_zero_prob:
+                zero_logits = torch.bmm(self.W_zero_logit(query_vecs), cell_emb_expanded).squeeze(2)
+                zero_probs = torch.sigmoid(zero_logits)
+
         elif self.arch_style == "concat query":
             query_vecs = self.query_activation(self.gene2query(gene_embs))
-            # expand cell_emb to (batch, seq_len, embsize)
+            
+            # Predict Dropout (Pi) - calculated early for concat style
             if self.explicit_zero_prob:
-                zero_logits = torch.bmm(self.W_zero_logit(query_vecs), self.query_activation(cell_emb.unsqueeze(2))).squeeze(2)
+                # Note: Logic copied from your snippet, using query * cell dot product for zero prob
+                # You might want to use the FC layers for this too, but keeping your logic:
+                zero_logits = torch.bmm(self.W_zero_logit(query_vecs), 
+                                      self.query_activation(cell_emb.unsqueeze(2))).squeeze(2)
                 zero_probs = torch.sigmoid(zero_logits)
-            cell_emb = cell_emb.unsqueeze(1).expand(-1, gene_embs.shape[1], -1)
-            h = self.hidden_activation(
-                self.fc1(torch.cat([cell_emb, query_vecs], dim=2))
-            )
-            pred_value = self.fc2(h).squeeze(2)
-            pred_value = self.expr_act(pred_value)
-            if not self.explicit_zero_prob:
-                return dict(pred=pred_value)
-            else:
-                return dict(pred=pred_value, zero_probs=zero_probs)
-        
+
+            # Predict Concentration
+            cell_emb_expanded = cell_emb.unsqueeze(1).expand(-1, gene_embs.shape[1], -1)
+            combined = torch.cat([cell_emb_expanded, query_vecs], dim=2)
+            h = self.hidden_activation(self.fc1(combined))
+            raw_pred = self.fc2(h).squeeze(2)
+            pred_concentration = self.expr_act(raw_pred)
+
         elif self.arch_style == "sum query":
             query_vecs = self.query_activation(self.gene2query(gene_embs))
             cell_emb = cell_emb.unsqueeze(1)
@@ -756,10 +779,95 @@ class MVCDecoder(nn.Module):
             h = self.hidden_activation(self.fc1(cell_emb + query_vecs))
             if self.explicit_zero_prob:
                 raise NotImplementedError
-            pred_value = self.fc2(h).squeeze(2)
-            pred_value = self.expr_act(pred_value)
-            return pred_value  # (batch, seq_len)
+            raw_pred = self.fc2(h).squeeze(2)
+            pred_concentration = self.expr_act(raw_pred)
 
+        # --- 3. Scale by Size Factor ---
+        # mu = concentration * size_factor
+        # target_size_factor is (batch, 1), broadcasts to (batch, seq_len)
+        mu = pred_concentration * target_size_factor
+
+        return {
+            "pred": mu,           # The scaled mean for NB loss
+            "dispersion": theta if self.dispersion else None,  # The dispersion parameter
+            "zero_probs": zero_probs if self.explicit_zero_prob else torch.zeros_like(mu)
+        }
+
+    def generate(
+        self, 
+        cell_emb: Tensor, 
+        gene_embs: Tensor, 
+        target_size_factor: Tensor = None,
+        n_samples: int = 1,
+        integer_output: bool = True,
+        sample = False,
+        zero_sample = False
+    ) -> Tensor:
+        """
+        Generates values (counts or expression) based on the model mode.
+
+        Args:
+            cell_emb: (Batch, d_model)
+            gene_embs: (Batch, Seq_Len, d_model)
+            target_size_factor: (Batch, 1) - Size factor to scale the mean.
+            n_samples: Number of independent samples to draw.
+            integer_output: If True, forces integer outputs (via NB or Poisson sampling).
+                            If False, returns continuous means (with stochastic zero-gating).
+
+        Returns:
+            Tensor: Shape (Batch, Seq_Len) or (Batch, Seq_Len, n_samples)
+        """
+        # 1. Forward Pass (No Grad)
+        with torch.no_grad():
+            outputs = self.forward(cell_emb, gene_embs, target_size_factor)
+            
+            mu = outputs['pred']               # (Batch, Seq_Len)
+            theta = outputs['dispersion']      # (Batch, Seq_Len) or None
+            pi = outputs['zero_probs']         # (Batch, Seq_Len) (can be 0s)
+            
+            # Expand for n_samples
+            if n_samples > 1:
+                mu = mu.unsqueeze(-1).expand(-1, -1, n_samples)
+                if theta is not None:
+                    theta = theta.unsqueeze(-1).expand(-1, -1, n_samples)
+                if self.explicit_zero_prob:
+                    pi = pi.unsqueeze(-1).expand(-1, -1, n_samples)
+
+            # --- BRANCH 1: Negative Binomial Mode (Dispersion Exists) ---
+            if theta is not None:
+                # Numerical stability for logits
+                eps = 1e-6
+                nb_logits = (mu + eps).log()-(theta + eps).log()
+                
+                # Sample NB
+                dist = torch.distributions.NegativeBinomial(total_count=theta, logits=nb_logits)
+                samples = dist.sample() if sample else mu
+
+            # --- BRANCH 2: Continuous/MSE Mode (No Dispersion) ---
+            else:
+                if integer_output:
+                    # User wants integers but model is continuous. 
+                    # Use Poisson as a fallback wrapper.
+                    # Ensure mean is positive (ReLU) because Poisson requires lambda > 0
+                    safe_mean = F.relu(mu)
+                    dist = torch.distributions.Poisson(rate=safe_mean)
+                    samples = dist.sample() if sample else safe_mean
+                else:
+                    # Just return the continuous prediction
+                    samples = mu
+
+            # --- Apply Zero-Inflation / Stochastic Gating ---
+            # Works for both NB (ZINB) and Continuous (Stochastic Gating)
+            if zero_sample:
+                # Bernoulli: 1 = Dropout, 0 = Keep
+                dropout_mask = torch.distributions.Bernoulli(probs=pi).sample()
+                samples = samples * dropout_mask
+
+            return {
+                'pred': samples,
+                'theta': theta,
+                'zero_probs': pi
+            }
 
 class AutoDiscretizationEmbedding(nn.Module):
     def __init__(self, dim, bin_num, bin_alpha, mask_token_id = None, pad_token_id = None):
