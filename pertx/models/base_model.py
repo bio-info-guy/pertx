@@ -66,7 +66,7 @@ class BaseModel(nn.Module):
         gene_emb_dim: int = 512,
         cross_attn_decoder: bool = False,
         decoder_layer: bool = False,
-        nbll: bool = False,
+        distribution: str = None,
         **kwargs
     ):
         super().__init__()
@@ -92,7 +92,10 @@ class BaseModel(nn.Module):
         self.dropout = dropout
         self.gene_emb_dim = gene_emb_dim
         self.decoder_layer = decoder_layer
-        self.nbll = nbll
+        self.distribution = distribution
+        self.d_hid = d_hid
+        if kwargs.get('nbll', False):
+            self.distribution = 'nb'
         if self.input_emb_style not in ["category", "continuous", "scaling",'autobin']:
             raise ValueError(
                 f"input_emb_style should be one of category, continuous, scaling or autobin "
@@ -107,20 +110,20 @@ class BaseModel(nn.Module):
             try:
                 from ..layers.flash_layers import FlashTransformerEncoderLayerVarlen
                 encoder_layers = FlashTransformerEncoderLayerVarlen(
-                    d_model,
-                    nhead,
-                    d_hid,
-                    dropout,
+                    self.d_model,
+                    self.nhead,
+                    self.d_hid,
+                    self.dropout,
                     batch_first=True,
                     norm_scheme=self.norm_scheme,
                 )
                 if self.decoder_layer:
                     from ..layers.flash_layers import FlashCrossTransformerLayer
                     decoder_layer = FlashCrossTransformerLayer(
-                        d_model,
-                        nhead,
-                        d_hid,
-                        dropout,
+                        self.d_model,
+                        self.nhead,
+                        self.d_hid,
+                        self.dropout,
                         norm_scheme=self.norm_scheme, # "pre" or "post"
                     )
                     self.transformer_decoder = decoder_layer
@@ -132,10 +135,10 @@ class BaseModel(nn.Module):
             try:
                 from ..layers.flash_layers import SDPATransformerEncoderLayer
                 encoder_layers = SDPATransformerEncoderLayer(
-                    d_model,
-                    nhead,
-                    d_hid,
-                    dropout,
+                    self.d_model,
+                    self.nhead,
+                    self.d_hid,
+                    self.dropout,
                     batch_first=True,
                     norm_scheme=self.norm_scheme,
                 )
@@ -145,7 +148,7 @@ class BaseModel(nn.Module):
                 self.use_fast_transformer = 'native'
         if self.use_fast_transformer == 'native':
             encoder_layers = TransformerEncoderLayer(
-                d_model, nhead, d_hid, dropout, batch_first=True
+                self.d_model,self.nhead, self.d_hid, self.dropout, batch_first=True
             )
         self.transformer_encoder = TransformerEncoder(encoder_layers,  nlayers)
         
@@ -154,7 +157,7 @@ class BaseModel(nn.Module):
         # GENE ENCODER
         if self.gene_emb_style == 'vanilla':
             self.base_emb = None
-            self.encoder = GeneEncoder(ntoken, d_model, padding_idx=self.pad_id)
+            self.encoder = GeneEncoder(ntoken, self.d_model, padding_idx=self.pad_id)
         elif self.gene_emb_style == 'hybrid':
             self.base_emb = GeneHybridEmbedding(
                 vocab_size = self.vocab_size,
@@ -168,17 +171,17 @@ class BaseModel(nn.Module):
 
         # VALUE ENCODER, NOTE: the scaling style is also handled in _encode method
         if self.input_emb_style == "continuous":
-            self.value_encoder = ContinuousValueEncoder(d_model, dropout)
+            self.value_encoder = ContinuousValueEncoder(self.d_model, self.dropout)
         elif self.input_emb_style == "category":
             assert n_input_bins > 0
             self.value_encoder = CategoryValueEncoder(
-                n_input_bins, d_model, padding_idx=pad_value
+                n_input_bins, self.d_model, padding_idx=pad_value
             )
         elif self.input_emb_style == 'autobin':
             """
             scFoundation Style Expression Encoder
             """
-            self.value_encoder = AutoDiscretizationEmbedding(dim = d_hid, 
+            self.value_encoder = AutoDiscretizationEmbedding(dim = self.d_model, 
                                                              bin_num = bin_num, 
                                                              bin_alpha = bin_alpha, 
                                                              mask_token_id = mask_value, 
@@ -191,7 +194,7 @@ class BaseModel(nn.Module):
 
         # BATCH ENCODER
         if use_batch_labels:
-            self.batch_encoder = BatchLabelEncoder(num_batch_labels, d_model)
+            self.batch_encoder = BatchLabelEncoder(num_batch_labels, self.d_model)
 
         if domain_spec_batchnorm is True or domain_spec_batchnorm == "dsbn":
             use_affine = True if domain_spec_batchnorm == "do_affine" else False
@@ -201,7 +204,7 @@ class BaseModel(nn.Module):
             )
         elif domain_spec_batchnorm == "batchnorm":
             print("Using simple batchnorm instead of domain specific batchnorm")
-            self.bn = nn.BatchNorm1d(d_model, eps=6.1e-5)
+            self.bn = nn.BatchNorm1d(self.d_model, eps=6.1e-5)
 
         # EXPRESSION DECODER
         self.decoder = ExprDecoder(
@@ -209,22 +212,22 @@ class BaseModel(nn.Module):
             explicit_zero_prob=explicit_zero_prob,
             use_batch_labels=use_batch_labels,
         )
-        self.cls_decoder = ClsDecoder(d_model, n_cls, nlayers=nlayers_cls)
+        self.cls_decoder = ClsDecoder(self.d_model, n_cls, nlayers=nlayers_cls)
 
         # MVC EXPRESSION DECODER
         if do_mvc:
             self.mvc_decoder = MVCDecoder(
-                d_model,
+                self.d_model,
                 arch_style=self.mvc_decoder_style,
                 explicit_zero_prob=self.explicit_zero_prob,
                 use_batch_labels=self.use_batch_labels,
                 expr_activation=self.expr_activation,
-                dispersion=self.nbll
+                distribution=self.distribution
             )
 
         if do_dab:
             self.grad_reverse_discriminator = AdversarialDiscriminator(
-                d_model,
+                self.d_model,
                 n_cls=num_batch_labels,
                 reverse_grad=True,
             )

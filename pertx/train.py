@@ -31,7 +31,7 @@ from .optim.loss import (
     criterion_neg_log_bernoulli, 
     masked_mse_loss, 
     masked_relative_error,
-    MaskedNBZINBLoss
+    GenerativeExpressionLoss
     )
 from .utils.graph import extract_master_edge_index
 
@@ -56,7 +56,7 @@ def train(model: nn.Module,
     criterion_pert = nn.CrossEntropyLoss()
     criterion_adv = nn.CrossEntropyLoss()  # consider using label smoothing
     criterion_ps = nn.MSELoss() # this is the loss for predicting PS scores
-    criterion_nb = MaskedNBZINBLoss(config.zero_inflated)
+    criterion_mvc = GenerativeExpressionLoss()
     #criterion_ps = nn.CrossEntropyLoss()
 
     if device is None:
@@ -193,58 +193,26 @@ def train(model: nn.Module,
                 mvc_target_values = target_values if config.get('mvc_masked_train', True) else mvc_val
                 mvc_target_values_next = target_values_next if config.get('mvc_masked_train', True) else batch_data["full_expr_next"].to(device)
                 mvc_masked_positions = masked_positions if config.get('mvc_masked_train', True) else torch.zeros_like(input_values)
-                if model.nbll:
-                    mvc_target_values = (torch.exp(mvc_target_values)-1)/sf
-                    loss_gepc, logp = criterion_nb(
-                        output_dict["mvc_output"][:,1:], 
-                        mvc_target_values[:,1:], 
-                        output_dict['mvc_dispersion'][:,1:], 
-                        output_dict["mvc_zero_probs"][:,1:],
-                        mvc_masked_positions[:,1:]
-                    )
-                    #if batch % 100 == 0:
-                        #print(mvc_target_values)
-                        #print('mvc loss comps')
-                        #print(mvc_masked_positions)
-                        #print(logp)
-                        #print(logp.max())
-                        #print(logp.min())
-                        
-                else:
-                    loss_gepc = criterion(
+                loss_gepc = criterion_mvc(
                         output_dict["mvc_output"], 
                         mvc_target_values, 
-                        mvc_masked_positions
+                        mvc_masked_positions,
+                        scale_factor = sf,
                     )
                 loss = loss + config.mvc_weight *loss_gepc
                 metrics_to_log.update({"train/mvc": loss_gepc.item()})
                 # added
-                if model.nbll:
-                    mvc_target_values_next = (torch.exp(mvc_target_values_next)-1)/sf_next
-                    loss_gepc_next, logp = criterion_nb(
-                        output_dict["mvc_output_next"][positions,1:], 
-                        mvc_target_values_next[positions,1:], 
-                        output_dict['mvc_dispersion_next'][positions,1:], 
-                        output_dict["mvc_zero_probs_next"][positions,1:],
-                        mvc_masked_positions[positions,1:]
-                    )
-                    #if batch % 100 == 0:
-                        #print(mvc_target_values_next)
-                        #print(mvc_masked_positions[positions])
-                        #print('mvc next loss comps')
-                        #print(logp)
-                        #print(logp.max())
-                        #print(logp.min())
-                else:
-                    loss_gepc_next = criterion(
-                        output_dict["mvc_output_next"][positions], 
-                        mvc_target_values_next[positions], 
-                        mvc_masked_positions[positions]
-                    )
+                loss_gepc_next = criterion_mvc(
+                    output_dict["mvc_output_next"], 
+                    mvc_target_values_next, 
+                    mvc_masked_positions,
+                    scale_factor = sf_next,
+                    positions = positions
+                )
                 loss = loss + config.mvc_next_weight * loss_gepc_next
                 metrics_to_log.update({"train/mvc_next": loss_gepc_next.item()})
                 
-                if config.explicit_zero_prob and not config.zero_inflated:
+                if config.explicit_zero_prob and config.distribution is None:
                     loss_gepc_zero_log_prob = criterion_neg_log_bernoulli(
                         output_dict["mvc_zero_probs"], mvc_target_values, mvc_masked_positions
                     )
@@ -483,7 +451,7 @@ def evaluate(model: nn.Module,
     criterion_pert = nn.CrossEntropyLoss()
     criterion_adv = nn.CrossEntropyLoss()  # consider using label smoothing
     criterion_ps = nn.MSELoss() # this is the loss for predicting PS scores
-    criterion_nb = MaskedNBZINBLoss(config.zero_inflated)
+    criterion_mvc = GenerativeExpressionLoss()
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -561,34 +529,17 @@ def evaluate(model: nn.Module,
                 if config.GEPC:
                     mvc_target_values = target_values if config.get('mvc_masked_train', True) else batch_data["full_expr"].to(device)
                     mvc_target_values_next = target_values_next if config.get('mvc_masked_train', True) else batch_data["full_expr_next"].to(device)
-                    mvc_masked_positions = masked_positions if config.get('mvc_masked_train', True) else None
+                    #mvc_masked_positions = masked_positions if config.get('mvc_masked_train', True) else None
 
-
-                if model.nbll:
-                    mvc_target_values = (torch.exp(mvc_target_values)-1)/sf
-                    loss_gepc, _ = criterion_nb(
-                        output_dict["mvc_output"][:,1:], 
-                        mvc_target_values[:,1:], 
-                        output_dict['mvc_dispersion'][:,1:], 
-                        output_dict["mvc_zero_probs"][:,1:],
-                        mvc_masked_positions[:,1:]
+                    loss_gepc = loss_gepc = criterion_mvc(
+                        output_dict["mvc_output"], 
+                        mvc_target_values, 
+                        scale_factor = sf,
                     )
-                    mvc_target_values_next = (torch.exp(mvc_target_values_next)-1)/sf_next
-                    loss_gepc_next, _ = criterion_nb(
-                        output_dict["mvc_output_next"][:,1:], 
-                        mvc_target_values_next[:,1:], 
-                        output_dict['mvc_dispersion_next'][:,1:], 
-                        output_dict["mvc_zero_probs_next"][:,1:],
-                        mvc_masked_positions[:,1:]
-                    )
-                    
-                else:
-                    loss_gepc = criterion(
-                        output_dict["mvc_output"], mvc_target_values, mvc_masked_positions
-                    )
-                    # added
-                    loss_gepc_next = criterion(
-                        output_dict["mvc_output_next"], mvc_target_values_next, mvc_masked_positions
+                    loss_gepc_next = criterion_mvc(
+                        output_dict["mvc_output_next"], 
+                        mvc_target_values_next, 
+                        scale_factor = sf_next,
                     )
                     
 
@@ -669,7 +620,8 @@ def eval_testdata(
     logger = None,
     predict_expr = False,
     mvc_full_expr = False,
-    nb_sf = False
+    sizefactor = False,
+    sample = True
 ) -> Optional[Dict]: # Returns a dictionary containing the AnnData object
     """
     Evaluate the model on test data and return an AnnData object with embeddings.
@@ -850,12 +802,13 @@ def eval_testdata(
                     batch_labels=torch.from_numpy(batch_ids).long() if config.use_batch_label else None, # if config.DSBN else None,
                     pert_labels = torch.from_numpy(perturbation_indexes).long() if config.perturbation_input else None,
                     pert_labels_next = torch.from_numpy(perturbation_indexes_next).long() if next_cell_prediction else None,
-                    sf = torch.Tensor(sf) if nb_sf else None,
+                    sf = torch.Tensor(sf) if sizefactor else None,
                     time_step=0,
                     return_np=True,
                     predict_expr = predict_expr,
                     mvc_src = full_gene_ids,
-                    mvc_val = full_val
+                    mvc_val = full_val,
+                    sample = sample
                 )
 
         cell_embeddings = cell_embeddings / np.linalg.norm(
@@ -873,9 +826,7 @@ def eval_testdata(
         if config.next_cell_pred_type ==  'lochness':
             adata_t.obsm["ps_pred_next"] = ps_preds_next 
         for k in expr_dict:
-            adata_t.obsm[k] = expr_dict[k][0]
-            if len(expr_dict[k]) > 1:
-                adata_t.obsm[k+'_zero'] =  expr_dict[k][1]
+            adata_t.obsm[k] = expr_dict[k]
         # require: genotype_to_index
 
         # Assuming ret_adata.obsm['X_pert_pred'] is a numpy array or can be converted to one
