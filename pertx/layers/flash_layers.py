@@ -4,7 +4,7 @@ from torch import nn, Tensor
 from typing import Dict, Mapping, Optional, Tuple, Any, Union
 from torch.nn.functional import scaled_dot_product_attention
 from torch.nn.attention import SDPBackend, sdpa_kernel
-
+from ..utils.misc import get_swiglu_hidden_dim
 FLASH_ATTENTION_VERSION = None
 flash_attn_qkvpacked_func = None
 flash_attn_varlen_func = None
@@ -68,11 +68,18 @@ class FlashTransformerEncoderLayerVarlen(nn.Module):
         self.qkv_proj = nn.Linear(d_model, 3 * d_model, bias=bias, **factory_kwargs)
         self.out_proj = nn.Linear(d_model, d_model, bias=bias, **factory_kwargs)
         
+        
         # Feedforward network
+        self.activation_f = activation
+        if self.activation_f != 'swiglu':
+            self.activation = self._get_activation_fn(activation)
+        else:
+            dim_feedforward = get_swiglu_hidden_dim(dim_feedforward, 64)
+            self.activation = nn.SiLU() 
+            self.w_gate = nn.Linear(d_model, dim_feedforward) # The new 3rd matrix
         self.linear1 = nn.Linear(d_model, dim_feedforward, **factory_kwargs)
         self.dropout = nn.Dropout(dropout)
         self.linear2 = nn.Linear(dim_feedforward, d_model, **factory_kwargs)
-
         # Layer normalization
         self.norm1 = nn.LayerNorm(d_model, eps=layer_norm_eps, **factory_kwargs)
         self.norm2 = nn.LayerNorm(d_model, eps=layer_norm_eps, **factory_kwargs)
@@ -81,7 +88,7 @@ class FlashTransformerEncoderLayerVarlen(nn.Module):
         self.dropout1 = nn.Dropout(dropout)
         self.dropout2 = nn.Dropout(dropout)
 
-        self.activation = self._get_activation_fn(activation)
+        
         self.norm_scheme = norm_scheme
         if self.norm_scheme not in ["pre", "post"]:
             raise ValueError(f"norm_scheme should be pre or post, not {norm_scheme}")
@@ -343,6 +350,20 @@ class FlashTransformerEncoderLayerVarlen(nn.Module):
         # Output projection
         return self.out_proj(attn_output)
 
+    def _run_ffn(self, x):
+        """Helper to switch between Standard and SwiGLU FFN"""
+        if self.activation_f == 'swiglu':
+            # SwiGLU Logic: (Swish(Gate) * Value) -> Output
+            # 1. Calculate the Gate (with activation)
+            gate = self.activation(self.w_gate(x))
+            # 2. Calculate the Value (linear1)
+            value = self.linear1(x)
+            # 3. Multiply and project back (linear2)
+            return self.linear2(self.dropout(gate * value))
+        else:
+            # Standard Logic: Linear -> Act -> Linear
+            return self.linear2(self.dropout(self.activation(self.linear1(x))))
+
     def forward(
         self,
         src: Tensor,
@@ -379,12 +400,12 @@ class FlashTransformerEncoderLayerVarlen(nn.Module):
         
         if self.norm_scheme == "pre":
             # Pre-normalization
-            src = self.norm1(src)
-            src2 = self._flash_attention(src, key_padding_mask=src_key_padding_mask)
+            src_norm = self.norm1(src)
+            src2 = self._flash_attention(src_norm, key_padding_mask=src_key_padding_mask)
             src = src + self.dropout1(src2)
             
-            src = self.norm2(src)
-            src2 = self.linear2(self.dropout(self.activation(self.linear1(src))))
+            src_norm = self.norm2(src)
+            src2 = self._run_ffn(src_norm)
             src = src + self.dropout2(src2)
         else:
             # Post-normalization
@@ -392,7 +413,7 @@ class FlashTransformerEncoderLayerVarlen(nn.Module):
             src = src + self.dropout1(src2)
             src = self.norm1(src)
             
-            src2 = self.linear2(self.dropout(self.activation(self.linear1(src))))
+            src2 = self._run_ffn(src)
             src = src + self.dropout2(src2)
             src = self.norm2(src)
         
@@ -442,18 +463,26 @@ class SDPATransformerEncoderLayer(nn.Module):
         self.qkv_proj = nn.Linear(d_model, 3 * d_model, bias=False, **factory_kwargs)
         self.out_proj = nn.Linear(d_model, d_model, bias=False, **factory_kwargs)
         
+
+
+        # Feedforward network
+        self.activation_f = activation
+        if self.activation_f != 'swiglu':
+            self.activation = self._get_activation_fn(activation)
+        else:
+            dim_feedforward = get_swiglu_hidden_dim(dim_feedforward, 64)
+            self.activation = nn.SiLU() 
+            self.w_gate = nn.Linear(d_model, dim_feedforward) # The new 3rd matrix
         # Feedforward network
         self.linear1 = nn.Linear(d_model, dim_feedforward, **factory_kwargs)
         self.dropout = nn.Dropout(dropout)
         self.linear2 = nn.Linear(dim_feedforward, d_model, **factory_kwargs)
-
         # Layer normalization and dropouts
         self.norm1 = nn.LayerNorm(d_model, eps=layer_norm_eps, **factory_kwargs)
         self.norm2 = nn.LayerNorm(d_model, eps=layer_norm_eps, **factory_kwargs)
         self.dropout1 = nn.Dropout(dropout)
         self.dropout2 = nn.Dropout(dropout)
 
-        self.activation = self._get_activation_fn(activation)
         self.norm_scheme = norm_scheme
         if self.norm_scheme not in ["pre", "post"]:
             raise ValueError(f"norm_scheme should be pre or post, not {norm_scheme}")
@@ -503,6 +532,21 @@ class SDPATransformerEncoderLayer(nn.Module):
         
         return self.out_proj(attn_output)
 
+    def _run_ffn(self, x):
+        """Helper to switch between Standard and SwiGLU FFN"""
+        if self.activation_f == 'swiglu':
+            # SwiGLU Logic: (Swish(Gate) * Value) -> Output
+            # 1. Calculate the Gate (with activation)
+            gate = self.activation(self.w_gate(x))
+            # 2. Calculate the Value (linear1)
+            value = self.linear1(x)
+            # 3. Multiply and project back (linear2)
+            return self.linear2(self.dropout(gate * value))
+        else:
+            # Standard Logic: Linear -> Act -> Linear
+            return self.linear2(self.dropout(self.activation(self.linear1(x))))
+
+
     def forward(
         self,
         src: Tensor,
@@ -522,14 +566,14 @@ class SDPATransformerEncoderLayer(nn.Module):
             src = src + self.dropout1(attn_out)
             
             src_norm = self.norm2(src)
-            ff_out = self.linear2(self.dropout(self.activation(self.linear1(src_norm))))
+            ff_out = self._run_ffn(src_norm)
             src = src + self.dropout2(ff_out)
         else: # post-norm
             attn_out = self._attention(src, key_padding_mask=src_key_padding_mask)
             src = src + self.dropout1(attn_out)
             src = self.norm1(src)
             
-            ff_out = self.linear2(self.dropout(self.activation(self.linear1(src))))
+            ff_out = self._run_ffn(src)
             src = src + self.dropout2(ff_out)
             src = self.norm2(src)
         
@@ -580,6 +624,15 @@ class FlashCrossTransformerLayer(nn.Module):
         self.dropout1 = nn.Dropout(dropout)
         self.norm1 = nn.LayerNorm(d_model, eps=layer_norm_eps, **factory_kwargs)
         
+
+        self.activation_f = activation
+        if self.activation_f != 'swiglu':
+            self.activation = self._get_activation_fn(activation)
+        else:
+            dim_feedforward = get_swiglu_hidden_dim(dim_feedforward, 64)
+            self.activation = nn.SiLU() 
+            self.w_gate = nn.Linear(d_model, dim_feedforward) # The new 3rd matrix
+
         # 2. Feed Forward Components
         self.linear1 = nn.Linear(d_model, dim_feedforward, **factory_kwargs)
         self.dropout = nn.Dropout(dropout)
@@ -587,7 +640,6 @@ class FlashCrossTransformerLayer(nn.Module):
         self.norm2 = nn.LayerNorm(d_model, eps=layer_norm_eps, **factory_kwargs)
         self.dropout2 = nn.Dropout(dropout)
 
-        self.activation = self._get_activation_fn(activation)
 
     @staticmethod
     def _get_activation_fn(activation):
@@ -693,6 +745,22 @@ class FlashCrossTransformerLayer(nn.Module):
         attn_out = attn_out_packed.view(batch_size, vocab_size, self.d_model)
         return self.out_proj(attn_out)
 
+    def _run_ffn(self, x):
+        """Helper to switch between Standard and SwiGLU FFN"""
+        if self.activation_f == 'swiglu':
+            # SwiGLU Logic: (Swish(Gate) * Value) -> Output
+            # 1. Calculate the Gate (with activation)
+            gate = self.activation(self.w_gate(x))
+            # 2. Calculate the Value (linear1)
+            value = self.linear1(x)
+            # 3. Multiply and project back (linear2)
+            return self.linear2(self.dropout(gate * value))
+        else:
+            # Standard Logic: Linear -> Act -> Linear
+            return self.linear2(self.dropout(self.activation(self.linear1(x))))
+
+
+
     def forward(
         self, 
         tgt: torch.Tensor, 
@@ -718,7 +786,7 @@ class FlashCrossTransformerLayer(nn.Module):
             
             # 2. Feed Forward Block
             tgt_norm = self.norm2(tgt)
-            ff_out = self.linear2(self.dropout(self.activation(self.linear1(tgt_norm))))
+            ff_out = self._run_ffn(tgt)
             tgt = tgt + self.dropout2(ff_out)
             
         # Post-Norm Architecture
@@ -728,7 +796,7 @@ class FlashCrossTransformerLayer(nn.Module):
             tgt = self.norm1(tgt + self.dropout1(attn_out))
             
             # 2. Feed Forward Block
-            ff_out = self.linear2(self.dropout(self.activation(self.linear1(tgt))))
+            ff_out = self._run_ffn(tgt)
             tgt = self.norm2(tgt + self.dropout2(ff_out))
             
         return tgt

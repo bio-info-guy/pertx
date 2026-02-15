@@ -93,3 +93,13 @@ def init_plot_worker():
             import scgpt
         except Exception:
             pass
+
+def get_swiglu_hidden_dim(hidden_dim, multiple_of=256):
+    
+    # We want 2/3 of that
+    hidden_dim = int(2 * hidden_dim / 3)
+    
+    # Round to the nearest multiple_of for efficiency
+    hidden_dim = multiple_of * ((hidden_dim + multiple_of - 1) // multiple_of)
+    
+    return hidden_dim

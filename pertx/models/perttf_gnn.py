@@ -464,13 +464,13 @@ class PertTFGraphModel(BaseModel):
             )
             output = raw_output.detach()
 
-            if return_np:
-                output = output.cpu().numpy()
-
-            outputs[i : i + batch_size] = output
-
+            
             #import pdb; pdb.set_trace()
             cell_emb = self._get_cell_emb_from_layer(raw_output, values_d)
+            output = cell_emb
+            if return_np:
+                output = output.cpu().numpy()
+            outputs[i : i + batch_size] = output
             tf_concat = None
             if pert_labels_next_d is not None:
                 pert_emb_next = self.pert_encoder(pert_labels_next_d)
@@ -483,7 +483,7 @@ class PertTFGraphModel(BaseModel):
                 cell_emb_next=self.pert_exp_encoder(tf_concat)
 
                 if return_np:
-                    cell_emb_next_cpu = cell_emb_next_cpu.cpu().numpy()
+                    cell_emb_next_cpu = cell_emb_next.cpu().numpy()
                 outputs_next[i : i + batch_size] = cell_emb_next_cpu
             else:
                 #cell_emb_next=None

@@ -3,11 +3,17 @@ from ..layers.modules import AdversarialDiscriminator
 
 
 import torch
+import torch.distributed as dist
 import importlib
 from torch.optim.lr_scheduler import (
     StepLR, CosineAnnealingLR, CosineAnnealingWarmRestarts, 
     LinearLR, SequentialLR, LambdaLR
 )
+
+
+import torch
+import importlib
+
 
 def select_optimizer(optimizer, model, lr, weight_decay = 0.01):
     """
@@ -18,6 +24,63 @@ def select_optimizer(optimizer, model, lr, weight_decay = 0.01):
     opt_name = optimizer.lower()
 
     # 1. Standard PyTorch Optimizers
+
+        # --- 1. Muon Implementation ---
+    if opt_name == "muon":
+        # Ensure muon is installed/available
+        if importlib.util.find_spec("muon") is None:
+            raise ImportError("Muon package not found. Ensure muon.py is in your path or installed.")
+        
+        # Import the specific classes defined in your uploaded muon.py
+        from muon import MuonWithAuxAdam, SingleDeviceMuonWithAuxAdam
+
+        # Define parameter buckets
+        muon_params = []
+        adam_params = []
+        
+        for name, p in model.named_parameters():
+            if not p.requires_grad:
+                continue
+            
+            # Partition logic based on Muon README:
+            # Muon: >= 2D tensors (Linear weights, Conv filters) EXCEPT embeddings
+            # AdamW: < 2D tensors (Biases, LayerNorms) AND Embeddings
+            if p.ndim >= 2 and "embed" not in name.lower():
+                muon_params.append(p)
+            else:
+                adam_params.append(p)
+
+        print(f"[Optimizer] Muon selected.")
+        print(f" > Muon Group: {len(muon_params)} tensors (2D Weights)")
+        print(f" > AdamW Group: {len(adam_params)} tensors (Embeds/Biases/LN)")
+
+        # Create parameter groups with the 'use_muon' flag required by MuonWithAuxAdam
+        param_groups = [
+            # Group 1: Muon (High LR, e.g., 0.02)
+            {
+                "params": muon_params,
+                "use_muon": True,
+                "lr": lr,                # Muon uses the main LR
+                "momentum": 0.95,        # Standard Muon momentum
+                "weight_decay": weight_decay
+            },
+            # Group 2: AdamW (Low LR, e.g., 0.0002)
+            {
+                "params": adam_params,
+                "use_muon": False,
+                "lr": lr * 0.01,         # Scale down Adam LR (0.02 -> 0.0002)
+                "betas": (0.9, 0.95),    # Standard Adam betas
+                "weight_decay": weight_decay
+            }
+        ]
+
+        # Select the correct class based on distributed status
+        if dist.is_initialized():
+            return MuonWithAuxAdam(param_groups)
+        else:
+            print("[Optimizer] Distributed not initialized. Using SingleDeviceMuonWithAuxAdam.")
+            return SingleDeviceMuonWithAuxAdam(param_groups)
+        
     if opt_name == "adam":
         return torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
     

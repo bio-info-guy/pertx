@@ -650,7 +650,7 @@ def eval_testdata(
         else adata_t.layers[input_layer_key]
     )
     from .data.dataloader import _get_sf
-    sf = _get_sf(all_counts) if nb_sf else None
+    sf = _get_sf(all_counts) if sizefactor else None
     if next_layer_key in adata_t.layers:
         all_counts_next = (
             adata_t.layers[next_layer_key].toarray()
@@ -803,7 +803,6 @@ def eval_testdata(
                     pert_labels = torch.from_numpy(perturbation_indexes).long() if config.perturbation_input else None,
                     pert_labels_next = torch.from_numpy(perturbation_indexes_next).long() if next_cell_prediction else None,
                     sf = torch.Tensor(sf) if sizefactor else None,
-                    time_step=0,
                     return_np=True,
                     predict_expr = predict_expr,
                     mvc_src = full_gene_ids,

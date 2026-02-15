@@ -43,6 +43,7 @@ class BaseModel(nn.Module):
         nlayers_cls: int = 3,
         n_cls: int = 1,
         dropout: float = 0.1,
+        ffn_activation: str = 'relu',
         pad_id: str = None,
         pad_value: int = -2,
         mask_value: int = -1,
@@ -93,6 +94,7 @@ class BaseModel(nn.Module):
         self.gene_emb_dim = gene_emb_dim
         self.decoder_layer = decoder_layer
         self.distribution = distribution
+        self.ffn_activation = ffn_activation
         self.d_hid = d_hid
         if kwargs.get('nbll', False):
             self.distribution = 'nb'
@@ -114,6 +116,7 @@ class BaseModel(nn.Module):
                     self.nhead,
                     self.d_hid,
                     self.dropout,
+                    self.ffn_activation,
                     batch_first=True,
                     norm_scheme=self.norm_scheme,
                 )
@@ -124,6 +127,7 @@ class BaseModel(nn.Module):
                         self.nhead,
                         self.d_hid,
                         self.dropout,
+                        self.ffn_activation,
                         norm_scheme=self.norm_scheme, # "pre" or "post"
                     )
                     self.transformer_decoder = decoder_layer
@@ -139,6 +143,7 @@ class BaseModel(nn.Module):
                     self.nhead,
                     self.d_hid,
                     self.dropout,
+                    self.ffn_activation,
                     batch_first=True,
                     norm_scheme=self.norm_scheme,
                 )
