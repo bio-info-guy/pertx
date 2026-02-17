@@ -107,7 +107,8 @@ class PertTFGraphModel(BaseModel):
                 explicit_zero_prob=self.explicit_zero_prob,
                 use_batch_labels=self.use_batch_labels,
                 expr_activation=self.expr_activation,
-                distribution=self.distribution
+                distribution=self.distribution,
+                sf_scaling=self.sf_scaling
             )
         else:
             self.mvc_decoder2 = None
@@ -383,7 +384,6 @@ class PertTFGraphModel(BaseModel):
         pert_labels: Optional[Tensor] = None, # the first perturbation
         pert_labels_next: Optional[Tensor] = None, # the second perturbation
         sf: Optional[Tensor] = None,
-
         return_np: bool = False,
         predict_expr = False,
         mvc_src: Tensor = None, # optional MVC tensor of gene ids for MVC decoder

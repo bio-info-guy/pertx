@@ -668,6 +668,7 @@ class MVCDecoder(nn.Module):
         distribution: str = None,  # Options: 'nb', 'zinb', 'hnb', 'zig', 'pois', 'zipois'
         use_batch_labels: bool = False,
         expr_activation: str = 'softplus',
+        sf_scaling = False
     ) -> None:
         super().__init__()
         self.distribution = None if distribution is None else distribution.lower()
@@ -684,7 +685,7 @@ class MVCDecoder(nn.Module):
 
         self.expr_activation = expr_activation if distribution is None else 'softplus' 
         d_in = d_model * 2 if use_batch_labels else d_model
-        
+        self.sf_scaling = sf_scaling
         if self.has_param2:
             self.gene2param2 = torch.nn.Linear(d_model, 1) 
 
@@ -787,8 +788,8 @@ class MVCDecoder(nn.Module):
         if self.distribution == 'zig':
             mu = pred_concentration
         else:
-            target_size_factor = 1 if target_size_factor is None else target_size_factor
-            mu = pred_concentration * target_size_factor
+            target_size_factor = 1 if target_size_factor is None or not self.sf_scaling else target_size_factor
+            mu = pred_concentration / target_size_factor
 
         return {
             "pred": mu,

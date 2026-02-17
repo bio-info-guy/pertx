@@ -68,6 +68,7 @@ class BaseModel(nn.Module):
         cross_attn_decoder: bool = False,
         decoder_layer: bool = False,
         distribution: str = None,
+        sf_scaling: bool = True,
         **kwargs
     ):
         super().__init__()
@@ -96,6 +97,7 @@ class BaseModel(nn.Module):
         self.distribution = distribution
         self.ffn_activation = ffn_activation
         self.d_hid = d_hid
+        self.sf_scaling = sf_scaling
         if kwargs.get('nbll', False):
             self.distribution = 'nb'
         if self.input_emb_style not in ["category", "continuous", "scaling",'autobin']:
@@ -227,7 +229,8 @@ class BaseModel(nn.Module):
                 explicit_zero_prob=self.explicit_zero_prob,
                 use_batch_labels=self.use_batch_labels,
                 expr_activation=self.expr_activation,
-                distribution=self.distribution
+                distribution=self.distribution,
+                manual_sf= self.sf_scaling
             )
 
         if do_dab:
